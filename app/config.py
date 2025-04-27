@@ -5,6 +5,7 @@
 
 import logging
 import time
+import json
 from pathlib import Path
 
 from pydantic import Field
@@ -36,52 +37,72 @@ class Config(BaseConfig):
     errors_room_id: str | None = Field(None, description="Room ID to send errors to")
     user_allowed_domains: list[str] = Field(
         ["*"],
-        description="List of allowed Tchap users email domains allowed to use Albert Tchap",
+        description="List of allowed Tchap users email domains allowed to use Matrix Webhook Bot",
     )
-    groups_used: list[str] = Field(["basic"], description="List of commands groups to use")
+    groups_used: list[str] = Field(["basic", "webhook", "tchap"], description="List of commands groups to use")
     last_activity: int = Field(int(time.time()), description="Last activity timestamp")
+    bot_name: str = Field("Matrix Webhook Bot", description="Name of the bot")
 
-    # Grist Api Key
-    grist_api_server: str = Field("", description="Grist Api Server")
-    grist_api_key: str = Field("", description="Grist API Key")
-    grist_users_table_id: str = Field("", description="Grist Users doc ID")
-    grist_users_table_name: str = Field("", description="Grist Users table name/ID")
+    # Webhook configuration
+    webhook_enabled: bool = Field(True, description="Enable webhook server")
+    webhook_host: str = Field("0.0.0.0", description="Webhook server host")
+    webhook_port: int = Field(8080, description="Webhook server port")
+    webhook_endpoint: str = Field("/webhook", description="Webhook server endpoint")
+    webhook_token: str = Field("", description="Webhook security token")
+    webhook_url: dict = Field({}, description="Webhook URLs for each room")
+    webhook_method: dict = Field({}, description="Webhook methods (GET/POST) for each room")
+    webhook_incoming_rooms: dict = Field({}, description="Room IDs for incoming webhook messages by token")
+    message_prefix: str = Field("", description="Prefix for messages sent by the bot")
+    
+    # Configuration globale des webhooks
+    global_webhook_url: str = Field("", description="URL globale du webhook pour tous les salons")
+    global_webhook_method: str = Field("GET", description="Méthode HTTP pour le webhook global (GET ou POST)")
+    global_webhook_auto_forward: bool = Field(True, description="Transférer automatiquement tous les messages vers le webhook global")
+    webhook_incoming_rooms_config: str = Field("{}", description="Configuration des salons pour le webhook entrant en JSON")
+    webhook_room_config: str = Field("{}", description="Configuration des webhooks spécifiques par salon en JSON")
 
-    # Albert API settings
-    albert_api_url: str = Field("http://localhost:8090", description="Albert API base URL")
-    albert_api_token: str = Field("", description="Albert API Token")
-
-    # Albert Conversation settings
-    # ============================
-    # PER USER SETTINGS !
-    # ============================
-    albert_collections_by_id: dict[str, dict] = Field({}, description="Collections to use for Albert API chat completion with RAG")
-    albert_model: str = Field(
-        "AgentPublic/albertlight-7b",
-        description="Albert model name to use (see Albert models hub on HuggingFace)",
-    )
-    albert_model_embedding: str = Field("BAAI/bge-m3", description="Embedding model (Rag, COT, etc)")
-    albert_mode: str = Field("rag", description="Albert API mode")
-    albert_with_history: bool = Field(True, description="Conversational mode")
-    albert_history_lookup: int = Field(0, description="How far we lookup in the history")
-    albert_max_rewind: int = Field(20, description="Max history rewind for stability purposes")
-    albert_my_private_collection_name: str = Field("ma_collection_privée", description="Name of the private collection for the user")
-    albert_all_public_command: str = Field("<all_public>", description="Command to use to get all public collections")
-    conversation_obsolescence: int = Field(
-        15 * 60, description="time after which a conversation is considered obsolete, in seconds"
-    )
-    last_rag_chunks: list[dict] | None = Field(None, description="Last chunks used for the RAG.")
-
-    @property
-    def is_conversation_obsolete(self) -> bool:
-        return int(time.time()) - self.last_activity > self.conversation_obsolescence
+    # Activer la configuration d'utilisateurs autorisés pour le bot
+    is_user_authorized: bool = Field(True, description="Enable user authorization")
+    
+    # Attributs d'Albert (pour compatibilité)
+    albert_api_url: str = Field("", description="URL de l'API Albert")
+    albert_api_token: str = Field("", description="Token de l'API Albert")
+    albert_model: str = Field("n8n", description="Modèle Albert")
+    albert_mode: str = Field("webhook", description="Mode Albert")
+    albert_with_history: bool = Field(False, description="Utiliser l'historique")
+    albert_history_lookup: int = Field(0, description="Nombre de messages d'historique")
+    albert_max_rewind: int = Field(10, description="Nombre maximum de messages d'historique")
+    albert_collections_by_id: dict = Field({}, description="Collections RAG par ID")
+    albert_all_public_command: str = Field("all", description="Commande pour utiliser toutes les collections")
+    albert_my_private_collection_name: str = Field("My private collection", description="Nom de la collection privée")
+    albert_model_embedding: str = Field("", description="Modèle d'embedding")
+    is_conversation_obsolete: bool = Field(False, description="Conversation obsolète")
 
     def update_last_activity(self) -> None:
         self.last_activity = int(time.time())
+    
+    def init_webhook_config(self):
+        """Initialiser la configuration des webhooks à partir des variables d'environnement"""
+        # Charger la configuration des webhooks entrants
+        try:
+            self.webhook_incoming_rooms = json.loads(self.webhook_incoming_rooms_config)
+        except json.JSONDecodeError:
+            self.webhook_incoming_rooms = {}
+        
+        # Charger la configuration des webhooks par salon
+        try:
+            room_config = json.loads(self.webhook_room_config)
+            for room_id, config in room_config.items():
+                self.webhook_url[room_id] = config.get("url", "")
+                self.webhook_method[room_id] = config.get("method", "GET")
+        except json.JSONDecodeError:
+            pass  # Garder les dictionnaires vides par défaut
 
 
 # Default config
 env_config = Config()
+# Initialiser la configuration des webhooks
+env_config.init_webhook_config()
 
 
 def use_systemd_config():

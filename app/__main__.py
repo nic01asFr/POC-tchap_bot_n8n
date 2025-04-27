@@ -3,7 +3,11 @@
 #
 # SPDX-License-Identifier: MIT
 
+import logging
 from bot import main
+from config import use_systemd_config
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    use_systemd_config()
     main()

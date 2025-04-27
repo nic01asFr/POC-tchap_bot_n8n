@@ -1,0 +1,42 @@
+services:
+  webhook-n8n:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: albert-tchap-n8n
+    restart: unless-stopped
+    ports:
+      - "8090:8090"  # Port pour le serveur webhook
+    volumes:
+      - ./app:/app/app  # Montage du code source
+      - ./data:/app/data  # Montage des données persistantes
+      - ./.env:/app/app/.env  # Montage direct du fichier .env
+    environment:
+      - WEBHOOK_ENABLED=True
+      - WEBHOOK_HOST=0.0.0.0
+      - WEBHOOK_PORT=8090
+      - WEBHOOK_ENDPOINT=/webhook
+      - WEBHOOK_TOKEN=${WEBHOOK_TOKEN}
+      - WEBHOOK_INCOMING_ROOMS_CONFIG=${WEBHOOK_INCOMING_ROOMS_CONFIG}
+      - WEBHOOK_ROOM_CONFIG=${WEBHOOK_ROOM_CONFIG}
+      - GLOBAL_WEBHOOK_URL=${GLOBAL_WEBHOOK_URL}
+      - GLOBAL_WEBHOOK_METHOD=${GLOBAL_WEBHOOK_METHOD}
+      - GLOBAL_WEBHOOK_AUTO_FORWARD=${GLOBAL_WEBHOOK_AUTO_FORWARD}
+      - WEBHOOK_SIMPLIFY_PAYLOAD=True
+      - WEBHOOK_MAX_MESSAGE_LENGTH=1000
+      - WEBHOOK_FILTER_METADATA=True
+      - MESSAGE_PREFIX=[WebhookBot-n8n]
+      - BOT_NAME=Webhook n8n Bot
+      - STORE_PATH=/app/data/store/
+      - SESSION_PATH=/app/data/session.txt
+      - LOG_LEVEL=10
+    networks:
+      - tchap-webhook-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Pour Linux - Permet d'accéder à localhost de la machine hôte
+    command: sh -c "pip install aiohttp && python -m app.webhook_optimized"  # Utiliser notre serveur optimisé
+
+networks:
+  tchap-webhook-network:
+    name: tchap-webhook-network
+    driver: bridge 

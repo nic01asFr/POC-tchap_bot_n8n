@@ -98,6 +98,18 @@ git merge <your-branch>
 git push origin staging
 ```
 
+### Fonctionnalités supplémentaires
+
+#### Commandes Tchap intégrées
+
+Le bot intègre les commandes spéciales de Tchap, permettant d'utiliser des formats et effets spéciaux similaires à ceux proposés nativement dans Tchap, comme :
+- `!spoiler` - Messages floutés
+- `!rainbow` - Messages colorés
+- `!confetti` - Messages avec confettis
+- Et plus encore...
+
+Pour plus de détails, consultez la [documentation des commandes Tchap](./README-TCHAP-COMMANDES.md).
+
 ### Troubleshooting
 
 Le premier sync est assez long, et a priori non bloquant. Si vous avez une interaction avec le bot avant qu'il se soit bien sync vous risquez de le laisser dans un état instable (où le bot n'a pas le listing des rooms).
@@ -174,6 +186,17 @@ To launch the bot:
 python app
 ```
 
+### Additional Features
+
+#### Integrated Tchap Commands
+
+The bot integrates special Tchap commands, allowing users to use special formats and effects similar to those natively offered in Tchap, such as:
+- `!spoiler` - Blurred messages
+- `!rainbow` - Colored messages
+- `!confetti` - Messages with confetti
+- And more...
+
+For more details, see the [Tchap commands documentation](./README-TCHAP-COMMANDES.md).
 
 ### Troubleshooting
 
@@ -190,3 +213,82 @@ To get started, take a look at [CONTRIBUTING.md](CONTRIBUTING.md).
 This project is licensed under the MIT License. A full copy of the license text can be found in the `LICENSES/MIT.txt` file.
 
 </details>
+
+# Albert-Tchap Webhook pour n8n
+
+Ce projet contient une application webhook optimisée pour intégrer Tchap avec n8n, permettant de recevoir des messages de Tchap et de les transmettre à n8n, ainsi que d'envoyer des messages à Tchap depuis n8n.
+
+## Configuration
+
+1. Copiez le fichier `.env.example` vers `.env` et modifiez les valeurs selon votre configuration :
+
+```bash
+cp .env.example .env
+```
+
+2. Modifiez les variables suivantes dans le fichier `.env` :
+
+- `GLOBAL_WEBHOOK_URL` : URL du webhook n8n qui recevra les messages de Tchap
+- `WEBHOOK_ROOM_CONFIG` : Configuration des webhooks spécifiques par salon (format JSON)
+- `WEBHOOK_INCOMING_ROOMS_CONFIG` : Configuration des salons pour le webhook entrant (format JSON)
+
+## Déploiement
+
+Lancez l'application avec Docker Compose :
+
+```bash
+docker-compose up -d
+```
+
+## Endpoints
+
+- `/webhook` : Endpoint principal pour recevoir les webhooks de Tchap
+- `/webhook/inbound` : Endpoint pour envoyer des messages à Tchap depuis n8n
+- `/test` : Endpoint de test pour vérifier que le serveur fonctionne correctement
+
+## Logs
+
+Les logs sont accessibles via Docker :
+
+```bash
+docker logs albert-tchap-n8n
+```
+
+## Test
+
+Vous pouvez tester le fonctionnement du serveur en accédant à l'URL :
+
+```
+http://localhost:8080/test
+```
+
+## Configuration des salons
+
+### Webhooks sortants (Tchap → n8n)
+
+Pour configurer un webhook sortant pour un salon spécifique, modifiez la variable `WEBHOOK_ROOM_CONFIG` dans le fichier `.env`. Le format est le suivant :
+
+```json
+{
+  "!room_id:serveur.org": {
+    "url": "https://votre-url-n8n.example.com/webhook",
+    "method": "GET"
+  }
+}
+```
+
+### Webhooks entrants (n8n → Tchap)
+
+Pour configurer un webhook entrant, modifiez la variable `WEBHOOK_INCOMING_ROOMS_CONFIG` dans le fichier `.env`. Le format est le suivant :
+
+```json
+{
+  "token": "!room_id:serveur.org"
+}
+```
+
+Vous pourrez ensuite envoyer des messages à Tchap depuis n8n en utilisant l'URL :
+
+```
+http://votre-serveur:8080/webhook/inbound?token=token&message=votre message
+```

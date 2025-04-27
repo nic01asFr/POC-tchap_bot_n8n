@@ -4,12 +4,16 @@
 # SPDX-License-Identifier: MIT
 
 import time
+import asyncio
 
-from matrix_bot.bot import MatrixBot
-from matrix_bot.config import logger
+from .matrix_bot.bot import MatrixBot
+from .matrix_bot.config import logger
 
-from commands import command_registry
-from config import env_config
+from .webhook_commands import command_registry
+from .config import env_config
+from .webhook_server import WebhookServer
+# Importer le module tchap_commands pour charger les commandes
+from . import tchap_commands  
 
 # TODO/IMPROVE:
 # - if albert-bot is invited in a salon, make it answer only when if it is tagged.
@@ -18,13 +22,27 @@ from config import env_config
 # - !info: show the chat setting (model, with_history).
 
 
+async def startup_tasks(bot):
+    """Run startup tasks for the bot"""
+    # Start webhook server if enabled
+    if env_config.webhook_enabled:
+        logger.info("Starting webhook server...")
+        webhook_server = WebhookServer(bot.matrix_client)
+        await webhook_server.start()
+        # Store webhook server in bot instance for later reference
+        bot.webhook_server = webhook_server
+        logger.info("Webhook server started successfully")
+
+
 def main():
-    tchap_bot = MatrixBot(
+    logger.info(f"Starting Matrix Webhook Bot...")
+    matrix_bot = MatrixBot(
         env_config.matrix_home_server,
         env_config.matrix_bot_username,
         env_config.matrix_bot_password,
     )
 
+    # Charger les commandes webhook uniquement
     for feature in [
         feature
         for feature_group in env_config.groups_used
@@ -32,19 +50,26 @@ def main():
     ]:
         callback = feature["func"]
         onEvent = feature["onEvent"]
-        tchap_bot.callbacks.register_on_custom_event(callback, onEvent, feature)
-        logger.info("loaded feature", feature=feature["name"])
+        matrix_bot.callbacks.register_on_custom_event(callback, onEvent, feature)
+        logger.info(f"Loaded feature: {feature['name']}")
 
-    # To send message if Albert is updated for example...
-    # async def startup_action(room_id):
-    #    await tchap_bot.matrix_client.send_markdown_message(room_id, command_registry.get_help())
-    # tchap_bot.callbacks.register_on_startup(startup_action)
+    # Register startup tasks
+    async def startup_action(room_id):
+        await startup_tasks(matrix_bot)
+        # Envoyer un message dans chaque salon lorsque le bot est connecté
+        await matrix_bot.matrix_client.send_text_message(
+            room_id, 
+            "🤖 Je suis en ligne et prêt à vous aider !",
+            msgtype="m.notice"
+        )
+    matrix_bot.callbacks.register_on_startup(startup_action)
 
     n_tries = 4
     err = None
     for i in range(n_tries):
         try:
-            tchap_bot.run()
+            logger.info("Starting Matrix bot...")
+            matrix_bot.run()
         except Exception as e:
             err = e
             logger.error(f"Bot startup failed with error: {e}")

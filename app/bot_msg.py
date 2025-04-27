@@ -13,7 +13,7 @@ class AlbertMsg:
     shorts = {
         "help": f"Pour retrouver ce message informatif, tapez `{COMMAND_PREFIX}aide`. Pour les geek tapez `{COMMAND_PREFIX}aide -v`.",
         "reset": f"Pour ré-initialiser notre conversation, tapez `{COMMAND_PREFIX}reset`",
-        "collections": f"Pour modifier l'ensemble des collections utilisées quand vous me posez une question, tapez `{COMMAND_PREFIX}collections list/use/unuse/info COLLECTION_NAME/{Config().albert_all_public_command}`",
+        "collections": f"Pour modifier l'ensemble des collections utilisées quand vous me posez une question, tapez `{COMMAND_PREFIX}collections list/use/unuse/info COLLECTION_NAME`",
         "conversation": f"Pour activer/désactiver le mode conversation, tapez `{COMMAND_PREFIX}conversation`",
         "debug": f"Pour afficher des informations sur la configuration actuelle, `{COMMAND_PREFIX}debug`",
         "model": f"Pour modifier le modèle, tapez `{COMMAND_PREFIX}model MODEL_NAME`",
@@ -34,7 +34,10 @@ class AlbertMsg:
     domain_not_allowed = "Albert n'est pas encore disponible pour votre domaine. Merci de rester en contact, il sera disponible après une phase beta test."
 
     def error_debug(reason, config):
-        msg = f"\u26a0\ufe0f **Albert API error**\n\n{reason}\n\n- Albert API URL: {config.albert_api_url}\n- Matrix server: {config.matrix_home_server}"
+        api_url = getattr(config, 'albert_api_url', 'N/A')
+        msg = f"\u26a0\ufe0f **Erreur**\n\n{reason}\n\n- Serveur Matrix: {config.matrix_home_server}"
+        if api_url != 'N/A':
+            msg = f"\u26a0\ufe0f **Albert API error**\n\n{reason}\n\n- Albert API URL: {api_url}\n- Matrix server: {config.matrix_home_server}"
         return msg
 
     def help(model_url, model_short_name, cmds):
@@ -73,8 +76,19 @@ class AlbertMsg:
     def debug(config: Config):
         msg = "🤖 Configuration actuelle :\n\n"
         msg += f"- Version: {APP_VERSION}\n"
-        msg += f"- API: {config.albert_api_url}\n"
-        msg += f"- Model: {config.albert_model}\n"
-        msg += f"- Mode: {config.albert_mode}\n"
-        msg += f"- With history: {config.albert_with_history}\n"
+        
+        # Vérifier si nous sommes en mode webhook ou Albert
+        if hasattr(config, 'webhook_enabled') and config.webhook_enabled:
+            msg += f"- Mode: Webhook\n"
+            msg += f"- Webhook host: {config.webhook_host}\n"
+            msg += f"- Webhook port: {config.webhook_port}\n"
+        
+        # Ajouter les infos Albert si disponibles
+        api_url = getattr(config, 'albert_api_url', None)
+        if api_url:
+            msg += f"- API: {api_url}\n"
+            msg += f"- Model: {getattr(config, 'albert_model', 'N/A')}\n"
+            msg += f"- Mode: {getattr(config, 'albert_mode', 'N/A')}\n"
+            msg += f"- With history: {getattr(config, 'albert_with_history', False)}\n"
+        
         return msg

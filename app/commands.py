@@ -5,6 +5,8 @@
 
 import asyncio
 import traceback
+import aiohttp
+import json
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import wraps
@@ -547,6 +549,119 @@ async def albert_document(ep: EventParser, matrix_client: MatrixClient):
 @register_feature(
     group="albert",
     onEvent=RoomMessageText,
+    command="webhook",
+    help="Configure le webhook n8n pour ce salon. Utilisation: !webhook set URL ou !webhook status pour voir l'URL actuelle",
+    for_geek=True,
+)
+@only_allowed_user
+async def set_webhook(ep: EventParser, matrix_client: MatrixClient):
+    config = user_configs[ep.sender]
+    
+    # Initialize webhook config if it doesn't exist
+    if not hasattr(config, 'webhook_url'):
+        config.webhook_url = {}
+    if not hasattr(config, 'webhook_method'):
+        config.webhook_method = {}
+    
+    parts = ep.command[1:] if ep.command and len(ep.command) > 1 else []
+    
+    if not parts:
+        message = "Utilisation: !webhook set URL [GET/POST] ou !webhook status"
+        await matrix_client.send_markdown_message(ep.room.room_id, message)
+        return
+    
+    action = parts[0].lower()
+    
+    if action == "set" and len(parts) > 1:
+        webhook_url = parts[1]
+        
+        # Par défaut, utiliser GET comme méthode, mais permettre de spécifier POST
+        webhook_method = "GET"
+        if len(parts) > 2:
+            method = parts[2].upper()
+            if method in ["GET", "POST"]:
+                webhook_method = method
+        
+        config.webhook_url[ep.room.room_id] = webhook_url
+        config.webhook_method[ep.room.room_id] = webhook_method
+        
+        message = f"Webhook configuré avec succès pour ce salon:\nURL: {webhook_url}\nMéthode: {webhook_method}"
+        await matrix_client.send_markdown_message(ep.room.room_id, message)
+    
+    elif action == "status":
+        webhook_url = config.webhook_url.get(ep.room.room_id, "Non configuré")
+        webhook_method = config.webhook_method.get(ep.room.room_id, "GET")
+        message = f"Configuration webhook actuelle:\nURL: {webhook_url}\nMéthode: {webhook_method}"
+        await matrix_client.send_markdown_message(ep.room.room_id, message)
+    
+    elif action == "test" and config.webhook_url.get(ep.room.room_id):
+        webhook_url = config.webhook_url.get(ep.room.room_id)
+        webhook_method = config.webhook_method.get(ep.room.room_id, "GET")
+        try:
+            await send_to_webhook(webhook_url, {
+                "event": "test",
+                "room_id": ep.room.room_id,
+                "sender": ep.sender,
+                "message": "Test du webhook n8n"
+            }, method=webhook_method)
+            message = f"Test du webhook envoyé avec succès (méthode: {webhook_method})"
+        except Exception as e:
+            message = f"Erreur lors du test du webhook: {str(e)}"
+        
+        await matrix_client.send_markdown_message(ep.room.room_id, message)
+    
+    else:
+        message = "Commande non reconnue. Utilisation: !webhook set URL [GET/POST] ou !webhook status"
+        await matrix_client.send_markdown_message(ep.room.room_id, message)
+
+@register_feature(
+    group="albert",
+    onEvent=RoomMessageText,
+    command="webhookin",
+    help="Configure un webhook entrant pour ce salon. Utilisation: !webhookin create pour générer une URL",
+    for_geek=True,
+)
+@only_allowed_user
+async def configure_incoming_webhook(ep: EventParser, matrix_client: MatrixClient):
+    from webhook_server import register_webhook_room
+    
+    config = user_configs[ep.sender]
+    parts = ep.command[1:] if ep.command and len(ep.command) > 1 else []
+    
+    if not parts:
+        message = "Utilisation: !webhookin create [token] - Crée une URL webhook pour recevoir des messages dans ce salon"
+        await matrix_client.send_markdown_message(ep.room.room_id, message)
+        return
+    
+    action = parts[0].lower()
+    
+    if action == "create":
+        token = parts[1] if len(parts) > 1 else None
+        webhook_url = await register_webhook_room(matrix_client, ep.room.room_id, token)
+        message = f"Webhook entrant configuré avec succès pour ce salon.\n\nURL: `{webhook_url}`\n\nUtilisez cette URL dans n8n pour envoyer des messages à ce salon."
+        await matrix_client.send_markdown_message(ep.room.room_id, message)
+    
+    elif action == "list":
+        # List all incoming webhooks for this room
+        room_webhooks = {token: room_id for token, room_id in env_config.webhook_incoming_rooms.items() if room_id == ep.room.room_id}
+        
+        if not room_webhooks:
+            message = "Aucun webhook entrant configuré pour ce salon."
+        else:
+            message = "Webhooks entrants configurés pour ce salon:\n\n"
+            for token, _ in room_webhooks.items():
+                webhook_url = f"http://{env_config.webhook_host}:{env_config.webhook_port}{env_config.webhook_endpoint}?token={token}"
+                message += f"- `{webhook_url}`\n"
+        
+        await matrix_client.send_markdown_message(ep.room.room_id, message)
+    
+    else:
+        message = "Commande non reconnue. Utilisation: !webhookin create [token] - Crée une URL webhook pour recevoir des messages dans ce salon"
+        await matrix_client.send_markdown_message(ep.room.room_id, message)
+
+@register_feature(
+    group="albert",
+    onEvent=RoomMessageText,
     help=None,
 )
 @only_allowed_user
@@ -655,6 +770,58 @@ async def albert_answer(ep: EventParser, matrix_client: MatrixClient):
     if not is_reply_to:
         config.albert_history_lookup += 1
 
+    # Extrait du code existant
+    body = get_cleanup_body(ep.event.body)
+    if not body:
+        return
+    
+    config = user_configs[ep.sender]
+    config.update_last_activity()
+
+    # Si une commande reconnue est détectée, on passe
+    if ep.is_command(COMMAND_PREFIX) and command_registry.is_valid_command(ep.event.body.strip().split()[0].removeprefix(COMMAND_PREFIX)):
+        return
+    
+    # Envoi du message au webhook si configuré
+    webhook_url = getattr(config, 'webhook_url', {}).get(ep.room.room_id)
+    if webhook_url:
+        try:
+            webhook_method = getattr(config, 'webhook_method', {}).get(ep.room.room_id, "GET")
+            message_data = {
+                "event": "message",
+                "room_id": ep.room.room_id,
+                "sender": ep.sender,
+                "message": body
+            }
+            await send_to_webhook(webhook_url, message_data, method=webhook_method)
+        except Exception as e:
+            logger.error(f"Erreur lors de l'envoi au webhook: {str(e)}")
+    
+    # Continue with the existing albert_answer function
+    # ... rest of the existing function ...
+
+async def send_to_webhook(webhook_url, data, method="GET"):
+    """Send data to the webhook URL using GET or POST"""
+    async with aiohttp.ClientSession() as session:
+        if method == "GET":
+            # Pour GET, convertir les données en paramètres de requête
+            params = {}
+            for key, value in data.items():
+                if isinstance(value, (dict, list)):
+                    params[key] = json.dumps(value)
+                else:
+                    params[key] = str(value)
+            
+            async with session.get(webhook_url, params=params) as response:
+                if response.status >= 400:
+                    raise Exception(f"Erreur HTTP {response.status}: {await response.text()}")
+                return await response.json() if response.content_type == 'application/json' else await response.text()
+        else:
+            # Pour POST, envoyer les données en JSON dans le corps
+            async with session.post(webhook_url, json=data) as response:
+                if response.status >= 400:
+                    raise Exception(f"Erreur HTTP {response.status}: {await response.text()}")
+                return await response.json() if response.content_type == 'application/json' else await response.text()
 
 @register_feature(
     group="albert",

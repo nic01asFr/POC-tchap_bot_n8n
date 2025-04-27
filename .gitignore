@@ -45,6 +45,7 @@ lib64/
 .vscode/
 _env
 .env
+.env.docker
 .venv
 env/
 venv/
