@@ -39,7 +39,7 @@ class Config(BaseConfig):
         ["*"],
         description="List of allowed Tchap users email domains allowed to use Matrix Webhook Bot",
     )
-    groups_used: list[str] = Field(["basic", "webhook", "tchap"], description="List of commands groups to use")
+    groups_used: list[str] = Field(["basic", "webhook", "tchap", "n8n"], description="List of commands groups to use")
     last_activity: int = Field(int(time.time()), description="Last activity timestamp")
     bot_name: str = Field("Matrix Webhook Bot", description="Name of the bot")
 
@@ -77,6 +77,13 @@ class Config(BaseConfig):
     albert_my_private_collection_name: str = Field("My private collection", description="Nom de la collection privée")
     albert_model_embedding: str = Field("", description="Modèle d'embedding")
     is_conversation_obsolete: bool = Field(False, description="Conversation obsolète")
+
+    # Configuration n8n
+    n8n_enabled: bool = Field(True, description="Activer l'intégration n8n")
+    n8n_base_url: str = Field("", description="URL de base de l'instance n8n")
+    n8n_auth_token: str = Field("", description="Token Bearer pour l'authentification n8n")
+    n8n_mcp_url: str = Field("", description="URL du serveur MCP")
+    n8n_tools_cache_ttl: int = Field(300, description="Durée de vie du cache des outils (en secondes)")
 
     def update_last_activity(self) -> None:
         self.last_activity = int(time.time())

@@ -14,6 +14,7 @@ from .config import env_config
 from .webhook_server import WebhookServer
 # Importer le module tchap_commands pour charger les commandes
 from . import tchap_commands  
+from . import n8n_commands  # Charger les commandes n8n
 
 # TODO/IMPROVE:
 # - if albert-bot is invited in a salon, make it answer only when if it is tagged.
