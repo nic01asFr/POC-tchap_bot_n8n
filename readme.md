@@ -10,13 +10,9 @@ Ce projet est une concrétisation de la vision **Colaig** - assistant IA intégr
 
 Colaig a été conçu comme une solution d'intelligence artificielle conversationnelle pensée spécifiquement pour le Bnum, capable de s'intégrer organiquement dans l'écosystème administratif. Ce POC transforme cette vision en une implémentation concrète en utilisant des technologies existantes et ouvertes.
 
-![template\_tchapbot.png](https://docs.numerique.gouv.fr/media/4df125ad-ea7c-4bbf-9b8e-e9e3b67d3097/attachments/7cb597cd-4516-48a7-af33-207ddf5d6727.png)
+![Capture d’écran 2025-04-27 023440.png](https://docs.numerique.gouv.fr/media/4df125ad-ea7c-4bbf-9b8e-e9e3b67d3097/attachments/bcf16eea-b5a0-42db-83e0-a4d0dd98ecb6.png)
 
 > Flow de connexion au tchapbot via webhook 
-
-![agent\_n8n.png](https://docs.numerique.gouv.fr/media/4df125ad-ea7c-4bbf-9b8e-e9e3b67d3097/attachments/4c45b4a5-28ff-4228-ae97-f4bdf7537d52.png)
-
-> Cadre de l'agent conversationnel en tant que tel intégré dans le workflow
 
 ![Capture d’écran 2025-04-24 044136.png](https://docs.numerique.gouv.fr/media/4df125ad-ea7c-4bbf-9b8e-e9e3b67d3097/attachments/72507361-4f1b-40e5-ad2e-2b870d8a2dc2.png)
 
