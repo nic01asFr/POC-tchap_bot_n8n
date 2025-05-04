@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   webhook-n8n:
     build:
@@ -30,13 +32,125 @@ services:
       - STORE_PATH=/app/data/store/
       - SESSION_PATH=/app/data/session.txt
       - LOG_LEVEL=10
+      # Configuration MCP pour se connecter au registry
+      - MCP_REGISTRY_URL=http://mcp-registry:8001
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
+      - MCP_SUGGEST_ENABLED=True
     networks:
       - tchap-webhook-network
     extra_hosts:
       - "host.docker.internal:host-gateway"  # Pour Linux - Permet d'accéder à localhost de la machine hôte
     command: sh -c "pip install aiohttp && python -m app.webhook_optimized"  # Utiliser notre serveur optimisé
+    depends_on:
+      - mcp-registry
+
+  # Service MCP Registry - Point central pour les outils MCP
+  mcp-registry:
+    build:
+      context: ./mcp-registry
+      dockerfile: Dockerfile.mcp-registry-standard
+    container_name: albert-tchap-mcp-registry
+    restart: unless-stopped
+    ports:
+      - "8001:8001"  # Port pour le MCP Registry
+    volumes:
+      - ./mcp-registry/app:/app/app
+      - ./mcp-registry/conf:/app/conf
+      - ./mcp-registry/data:/app/data
+      - ./.env:/app/.env
+    environment:
+      - MCP_APP_PORT=8001
+      - MCP_HOST=0.0.0.0
+      - MCP_DISCOVERY_ENABLED=true
+      - MCP_FEATURES_RESOURCES=true
+      - MCP_FEATURES_PROMPTS=true
+      - MCP_FEATURES_TOOLS=true
+      - LOG_LEVEL=INFO
+      - ALBERT_API_TOKEN=${ALBERT_API_TOKEN}
+      - ALBERT_API_URL=https://albert.api.etalab.gouv.fr
+      - ALBERT_MODEL=${ALBERT_MODEL}
+      # Configuration des serveurs MCP à découvrir automatiquement
+      - MCP_SERVER_URLS=http://grist-mcp:8083/mcp
+      - MCP_AUTO_START_DISABLED=true
+    networks:
+      - albert-tchap-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # Serveur MCP pour Grist
+  grist-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.grist-mcp
+    container_name: albert-tchap-grist-mcp
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    environment:
+      - GRIST_API_KEY=${GRIST_API_KEY}
+      - GRIST_API_URL=${GRIST_SERVER_URL}/api
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8083
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./grist_mcp_server.py:/app/grist_mcp_server.py
+      - ./grist_mcp.env:/app/.env
+    networks:
+      - albert-tchap-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/mcp/info"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      - mcp-registry
+
+  # Orchestrateur MCP
+  mcp-orchestrator:
+    build:
+      context: ./albert-mcp-orchestrator
+      dockerfile: Dockerfile
+    container_name: albert-mcp-orchestrator
+    restart: unless-stopped
+    ports:
+      - "8002:8000"  # Port pour l'orchestrateur
+    environment:
+      - MCP_REGISTRY_URL=http://mcp-registry:8001
+      - LOG_LEVEL=INFO
+      - ALBERT_API_TOKEN=${ALBERT_API_TOKEN}
+      - ALBERT_API_URL=${ALBERT_API_URL}
+    volumes:
+      - ./albert-mcp-orchestrator:/app
+    networks:
+      - albert-tchap-network
+    depends_on:
+      - mcp-registry
+      - grist-mcp
+
+  vector-db:
+    image: redis/redis-stack:latest
+    container_name: albert-tchap-vector-db
+    restart: unless-stopped
+    ports:
+      - "6379:6379"  # Port Redis
+      - "8005:8001"  # Port RedisInsight (changé de 8001:8001)
+    volumes:
+      - vector-db-data:/data
+    networks:
+      - tchap-webhook-network
+
+volumes:
+  vector-db-data:
 
 networks:
   tchap-webhook-network:
     name: tchap-webhook-network
-    driver: bridge 
+    driver: bridge
+  albert-tchap-network:
+    name: albert-tchap-network
+    driver: bridge

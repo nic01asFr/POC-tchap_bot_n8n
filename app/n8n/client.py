@@ -7,6 +7,7 @@ Ce module permet de découvrir et d'utiliser les capacités exposées par n8n.
 import json
 import aiohttp
 import logging
+import asyncio
 from typing import Dict, List, Optional, Any, Union
 from urllib.parse import urljoin
 
@@ -34,29 +35,59 @@ class N8nClient:
     async def fetch_capabilities(self) -> Dict:
         """Récupère toutes les capacités disponibles depuis n8n"""
         try:
+            # Utiliser spécifiquement l'endpoint catalog/all
+            catalog_url = f"{self.base_url}/webhook/catalog/all"
+            logger.info(f"Récupération des capacités n8n depuis {catalog_url}")
+            logger.info(f"Headers d'authentification: Bearer Token présent: {'Oui' if self.headers.get('Authorization') else 'Non'}")
+            
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"{self.base_url}/webhook/catalog/all", 
-                                       headers=self.headers) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        self.tools_cache = result
-                        logger.info(f"Capacités récupérées: {len(result.get('tools', []))} outils")
-                        
-                        # Organiser par catégories
-                        categories = {}
-                        for tool in result.get("tools", []):
-                            category = tool.get("category", "general")
-                            if category not in categories:
-                                categories[category] = []
-                            categories[category].append(tool)
-                        
-                        self.categories_cache = categories
-                        return result
+                logger.debug(f"Envoi de la requête GET à {catalog_url}")
+                async with session.get(catalog_url, headers=self.headers, timeout=30) as response:
+                    status_code = response.status
+                    logger.info(f"Réponse reçue du catalog avec statut: {status_code}")
+                    
+                    if status_code == 200:
+                        try:
+                            result = await response.json()
+                            tools_count = len(result.get("tools", []))
+                            logger.info(f"Capacités récupérées: {tools_count} outils")
+                            
+                            if tools_count == 0:
+                                logger.warning("Le catalogue a retourné une liste vide d'outils")
+                                
+                            # Loguer les premières capacités pour débogage
+                            if tools_count > 0:
+                                first_tools = result.get("tools", [])[:3]  # Limite à 3 pour ne pas surcharger les logs
+                                logger.debug(f"Échantillon des outils: {json.dumps(first_tools, indent=2)}")
+                            
+                            # Organiser par catégories
+                            categories = {}
+                            for tool in result.get("tools", []):
+                                category = tool.get("category", "general")
+                                if category not in categories:
+                                    categories[category] = []
+                                categories[category].append(tool)
+                            
+                            self.tools_cache = result
+                            self.categories_cache = categories
+                            
+                            logger.info(f"Catégories trouvées: {list(categories.keys())}")
+                            return result
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Erreur lors du parsing de la réponse JSON: {e}")
+                            content = await response.text()
+                            logger.error(f"Contenu brut reçu: {content[:500]}...")  # Limite pour éviter de surcharger les logs
+                            return {"error": "Erreur format JSON", "tools": []}
                     else:
-                        logger.error(f"Erreur lors de la récupération des capacités: {response.status}")
-                        return {"error": f"Erreur {response.status}", "tools": []}
+                        logger.error(f"Erreur lors de la récupération des capacités: {status_code}")
+                        content = await response.text()
+                        logger.error(f"Détail de la réponse: {content}")
+                        return {"error": f"Erreur {status_code}", "tools": []}
+        except asyncio.TimeoutError:
+            logger.error("Timeout lors de la récupération des capacités n8n")
+            return {"error": "Timeout de la requête", "tools": []}
         except Exception as e:
-            logger.exception("Exception lors de la récupération des capacités")
+            logger.exception(f"Exception lors de la récupération des capacités: {str(e)}")
             return {"error": str(e), "tools": []}
     
     async def get_mcp_schema(self, mcp_url: str) -> Dict:

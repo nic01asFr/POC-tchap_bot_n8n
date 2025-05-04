@@ -24,6 +24,7 @@ from .eventparser import (
     EventParser,
     MessageEventParser,
 )
+from ..webhook_optimized import initialize_room
 
 
 def properly_fail(matrix_client, error_msg=AlbertMsg.failed):
@@ -118,11 +119,47 @@ class Callbacks:
         if not event.membership == "invite":
             return
 
+        # Vérifier que l'invitation est bien adressée au bot
+        if event.state_key != self.matrix_client.user_id:
+            logger.debug(f"Invitation ignorée car non adressée au bot: {event.state_key} != {self.matrix_client.user_id}")
+            return
+        
+        logger.info(f"Invitation reçue pour le salon {room.room_id} de la part de {event.sender}")
         try:
-            await self.matrix_client.join(room.room_id)
-            logger.info(f"Joined {room.room_id}")
+            # Afficher plus d'informations sur l'invitation
+            room_name = room.name or "Salon sans nom"
+            logger.info(f"Tentative de rejoindre le salon: {room_name} ({room.room_id})")
+            
+            # Essayer de rejoindre le salon
+            join_response = await self.matrix_client.join(room.room_id)
+            
+            if hasattr(join_response, "room_id"):
+                logger.info(f"Salon rejoint avec succès: {room.room_id}")
+                
+                # Initialiser le salon après l'avoir rejoint
+                # Récupérer le token d'accès du client Matrix
+                access_token = self.matrix_client.access_token
+                if access_token:
+                    # Initialiser le salon avec les informations de base
+                    await initialize_room(room.room_id, access_token)
+                    logger.info(f"Salon {room.room_id} initialisé après invitation")
+                    
+                    # Envoyer un message de bienvenue
+                    welcome_message = "Bonjour ! Je suis Albert, le bot assistant pour Tchap. Utilisez `!aide` pour voir la liste des commandes disponibles."
+                    try:
+                        await self.matrix_client.send_markdown_message(room.room_id, welcome_message)
+                        logger.info(f"Message de bienvenue envoyé dans le salon {room.room_id}")
+                    except Exception as msg_error:
+                        logger.error(f"Erreur lors de l'envoi du message de bienvenue: {str(msg_error)}")
+                else:
+                    logger.warning(f"Impossible d'initialiser le salon {room.room_id} : pas de token d'accès")
+            else:
+                error_msg = getattr(join_response, "message", "Raison inconnue")
+                logger.error(f"Échec lors de la tentative de rejoindre le salon {room.room_id}: {error_msg}")
         except Exception as join_room_exception:
-            logger.info(f"Failed to join {room.room_id}", join_room_exceptions=join_room_exception)
+            logger.error(f"Erreur lors de la tentative de rejoindre le salon {room.room_id}: {str(join_room_exception)}")
+            import traceback
+            logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
 
     async def decryption_failure(self, room: MatrixRoom, event: MegolmEvent):
         """Callback for handling decryption errors."""

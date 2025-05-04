@@ -1,0 +1,44 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Installation des dépendances système
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copier les fichiers de dépendances
+COPY requirements.txt /app/
+
+# Installer les dépendances Python
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copier le code source de l'application
+COPY ./app /app/app
+COPY ./scripts /app/scripts
+COPY ./conf /app/conf
+
+# Créer les répertoires nécessaires
+RUN mkdir -p /app/data/embeddings_cache
+
+# Rendre les scripts exécutables
+RUN chmod +x /app/scripts/setup_mcp_clients.py
+
+# Exposer le port pour le MCP Registry
+EXPOSE 8001
+
+# Variables d'environnement par défaut
+ENV MCP_APP_PORT=8001 \
+    MCP_HOST=0.0.0.0 \
+    MCP_DISCOVERY_ENABLED=true \
+    MCP_FEATURES_RESOURCES=true \
+    MCP_FEATURES_PROMPTS=true \
+    MCP_FEATURES_TOOLS=true \
+    LOG_LEVEL=INFO
+
+# Point d'entrée
+ENTRYPOINT ["uvicorn", "app.main:app", "--host", "0.0.0.0"]
+
+# Arguments de commande par défaut
+CMD ["--port", "8001"] 

@@ -1,0 +1,32 @@
+# Configuration du MCP Registry
+app:
+  name: "MCP Registry Service"
+  version: "1.0.0"
+  description: "Service de gestion des serveurs MCP"
+  host: "0.0.0.0"
+  port: 8001
+
+registry:
+  discovery_interval: 300  # 5 minutes
+  discovery_enabled: true
+  cache_ttl: 3600  # 1 heure
+  manage_servers: true    # Activer la gestion des serveurs
+  server_urls:            # URLs des serveurs MCP connus pour la découverte automatique
+    - "http://grist-mcp:8083/mcp"  # URL du serveur MCP Grist dans Docker via nom de service
+    - "http://host.docker.internal:8083/mcp"  # URL alternative pour l'hôte
+
+# Configuration des endpoints MCP
+mcp:
+  endpoints:
+    base: "/mcp"               # Endpoint de base pour les requêtes MCP
+    stream: "/mcp/stream"      # Endpoint pour les échanges streamés
+    capabilities: "/capabilities" # Endpoint pour obtenir les capacités
+    discovery: "/discovery"    # Endpoint pour la découverte des serveurs
+
+# Configuration de l'embedding
+embedding:
+  use_albert_api: true     # Utiliser l'API Albert pour les embeddings
+  model: "embeddings-small"  # Modèle utilisé par Albert API
+  dimension: 512           # Dimension pour le modèle embeddings-small
+  cache_dir: "./embeddings_cache"
+

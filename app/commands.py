@@ -35,7 +35,8 @@ from tchap_utils import (
     get_decrypted_file,
     get_previous_messages, 
     get_thread_messages, 
-    isa_reply_to
+    isa_reply_to,
+    room_is_direct_message,
 )
 
 @dataclass
@@ -743,10 +744,6 @@ async def albert_answer(ep: EventParser, matrix_client: MatrixClient):
         config.albert_history_lookup = initial_history_lookup
         return
 
-    logger.debug(f"{user_query=}")
-    logger.debug(f"{answer=}")
-
-    reply_to = None
     if is_reply_to:
         # "content" ->  "m.mentions": {"user_ids": [ep.sender]},
         # "content" -> "m.relates_to": {"m.in_reply_to": {"event_id": ep.event.event_id}},
@@ -782,7 +779,8 @@ async def albert_answer(ep: EventParser, matrix_client: MatrixClient):
     if ep.is_command(COMMAND_PREFIX) and command_registry.is_valid_command(ep.event.body.strip().split()[0].removeprefix(COMMAND_PREFIX)):
         return
     
-    # Envoi du message au webhook si configuré
+    # Gestion des webhooks spécifiques à Matrix/Tchap uniquement
+    # Conservation de l'envoi vers les webhooks configurés pour les salons Tchap
     webhook_url = getattr(config, 'webhook_url', {}).get(ep.room.room_id)
     if webhook_url:
         try:
@@ -796,9 +794,6 @@ async def albert_answer(ep: EventParser, matrix_client: MatrixClient):
             await send_to_webhook(webhook_url, message_data, method=webhook_method)
         except Exception as e:
             logger.error(f"Erreur lors de l'envoi au webhook: {str(e)}")
-    
-    # Continue with the existing albert_answer function
-    # ... rest of the existing function ...
 
 async def send_to_webhook(webhook_url, data, method="GET"):
     """Send data to the webhook URL using GET or POST"""
@@ -852,3 +847,82 @@ async def albert_wrong_command(ep: EventParser, matrix_client: MatrixClient):
     await matrix_client.send_markdown_message(
         ep.room.room_id, AlbertMsg.unknown_command(cmds_msg), msgtype="m.notice"
     )
+
+@register_feature(
+    group="albert",
+    onEvent=RoomMessageText,
+    command="listrooms",
+    help="Liste tous les salons auxquels le bot est connecté",
+)
+async def list_connected_rooms(ep: EventParser, matrix_client: MatrixClient):
+    """Liste tous les salons auxquels le bot est connecté"""
+    config = user_configs[ep.sender]
+    config.update_last_activity()
+    
+    await matrix_client.room_typing(ep.room.room_id, typing_state=True)
+    
+    # Récupérer tous les salons
+    try:
+        # Récupération des salles directement depuis le client Matrix
+        all_rooms = matrix_client.rooms
+        
+        if not all_rooms:
+            await matrix_client.send_markdown_message(
+                ep.room.room_id,
+                "Je ne suis connecté à aucun salon actuellement.",
+                msgtype="m.notice"
+            )
+            return
+        
+        # Préparer le message avec la liste des salons
+        msg_parts = ["**Liste des salons auxquels je suis connecté:**\n"]
+        
+        # Séparer les DMs et les salons de groupe
+        dms = []
+        group_rooms = []
+        
+        for room_id, room in all_rooms.items():
+            # Récupérer le nom du salon ou créer un nom basé sur les membres pour les DMs
+            if room.name:
+                room_name = room.name
+            else:
+                # Pour les DMs sans nom, utiliser les noms des utilisateurs
+                members = list(room.users.values())
+                member_names = [m.display_name for m in members if m.user_id != matrix_client.user_id]
+                room_name = ", ".join(member_names) if member_names else "Salon sans nom"
+            
+            # Déterminer si c'est un DM ou un salon de groupe
+            is_dm = room_is_direct_message(room)
+            
+            room_info = f"- **{room_name}** (`{room_id}`)"
+            
+            if is_dm:
+                dms.append(room_info)
+            else:
+                group_rooms.append(room_info)
+        
+        # Ajouter les salons de groupe au message
+        if group_rooms:
+            msg_parts.append("\n**Salons de groupe:**")
+            msg_parts.extend(group_rooms)
+        
+        # Ajouter les DMs au message
+        if dms:
+            msg_parts.append("\n**Messages directs:**")
+            msg_parts.extend(dms)
+        
+        # Envoyer le message
+        await matrix_client.send_markdown_message(
+            ep.room.room_id,
+            "\n".join(msg_parts),
+            msgtype="m.notice"
+        )
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des salons: {str(e)}")
+        await matrix_client.send_markdown_message(
+            ep.room.room_id,
+            f"Une erreur s'est produite lors de la récupération des salons: {str(e)}",
+            msgtype="m.notice"
+        )
+    finally:
+        await matrix_client.room_typing(ep.room.room_id, typing_state=False)

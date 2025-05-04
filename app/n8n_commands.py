@@ -10,7 +10,7 @@ from matrix_bot.eventparser import EventParser, EventNotConcerned
 from nio import RoomMessageText
 
 from bot_msg import AlbertMsg
-from config import COMMAND_PREFIX, Config
+from config import COMMAND_PREFIX, Config, env_config
 from commands import register_feature, command_registry, only_allowed_user, user_configs
 from n8n.client import N8nClient
 from n8n.command import N8nCommandHandler
@@ -52,20 +52,52 @@ async def n8n_tools(ep: EventParser, matrix_client: MatrixClient):
     
     # Vérifier que n8n est activé
     if not init_n8n(config):
+        logger.error("L'intégration n8n n'est pas activée ou configurée correctement")
         message = "⚠️ L'intégration n8n n'est pas activée."
         await matrix_client.send_markdown_message(ep.room.room_id, message, msgtype="m.notice")
         return
     
+    logger.info(f"Traitement de la commande !tools dans le salon {ep.room.room_id}")
+    logger.info(f"Configuration n8n - Base URL: {env_config.n8n_base_url}")
+    logger.info(f"Configuration n8n - Token défini: {'Oui' if env_config.n8n_auth_token else 'Non'}")
+    
+    # Indiquer à l'utilisateur que nous traitons sa demande
     await matrix_client.room_typing(ep.room.room_id)
     
     # Extraire les arguments de la commande
     command = ep.get_command()
     args = " ".join(command[1:]) if len(command) > 1 else ""
     
+    logger.info(f"Arguments de la commande !tools: '{args}'")
+    
+    # Message temporaire pour indiquer que la requête est en cours
+    temp_message = "Récupération des outils disponibles..."
+    temp_event_id = await matrix_client.send_markdown_message(ep.room.room_id, temp_message, msgtype="m.notice")
+    
     # Appeler le gestionnaire de commandes
-    response = await n8n_command_handler.handle_tools_command(args)
+    try:
+        logger.info("Appel à n8n_command_handler.handle_tools_command")
+        # Forcer un rafraîchissement du cache des outils
+        await n8n_command_handler.n8n_client.fetch_capabilities()
+        logger.info("Capacités récupérées, traitement de la commande")
+        
+        response = await n8n_command_handler.handle_tools_command(args)
+        logger.info(f"Réponse du gestionnaire obtenue, longueur: {len(response)}")
+        
+        # Supprimer le message temporaire si possible
+        if temp_event_id:
+            try:
+                await matrix_client.redact_message(ep.room.room_id, temp_event_id, reason="Remplacé par la réponse complète")
+                logger.info("Message temporaire supprimé")
+            except Exception as e:
+                logger.warning(f"Impossible de supprimer le message temporaire: {e}")
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de l'appel à handle_tools_command: {str(e)}")
+        response = f"⚠️ Erreur lors de la récupération des outils: {str(e)}"
     
     await matrix_client.send_markdown_message(ep.room.room_id, response, msgtype="m.notice")
+    logger.info("Réponse envoyée à l'utilisateur")
 
 
 @register_feature(

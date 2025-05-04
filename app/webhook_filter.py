@@ -200,6 +200,12 @@ def is_agent_ia_destination(data: Dict[str, Any]) -> bool:
     Returns:
         True si la destination est probablement un agent IA
     """
+    # Vérifier si le message est une commande !tools, qui doit être traitée par n8n_commands
+    message = data.get("message", "").strip()
+    if message == "!tools" or message.startswith("!tools "):
+        logger.info("Commande !tools détectée, ne sera pas envoyée à l'agent IA")
+        return False
+    
     # Vérifier si l'URL cible contient des indicateurs d'agent IA
     target_url = os.environ.get("GLOBAL_WEBHOOK_URL", "")
     room_id = data.get("room_id", "")

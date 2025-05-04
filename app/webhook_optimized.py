@@ -11,6 +11,10 @@ import dotenv
 import markdown
 from aiohttp import web
 from urllib.parse import urlencode
+from typing import Dict, Any, List, Optional, Tuple, Union
+import time
+import traceback
+import hashlib
 
 # Charger les variables d'environnement du fichier .env
 dotenv.load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
@@ -29,7 +33,7 @@ logger.setLevel(log_level)  # S'assurer que ce logger spécifique utilise bien l
 
 # Configuration du webhook
 WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "0.0.0.0")
-WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "8080"))
+WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", 8090))
 WEBHOOK_ENDPOINT = os.environ.get("WEBHOOK_ENDPOINT", "/webhook")
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 
@@ -66,7 +70,7 @@ except json.JSONDecodeError:
     WEBHOOK_INCOMING_ROOMS_CONFIG = {}
 
 # Configuration pour l'accès à l'API Matrix
-MATRIX_HOMESERVER = os.environ.get("MATRIX_HOME_SERVER", "")
+MATRIX_HOMESERVER = os.environ.get("MATRIX_HOMESERVER", "")
 MATRIX_USERNAME = os.environ.get("MATRIX_BOT_USERNAME", "")
 MATRIX_PASSWORD = os.environ.get("MATRIX_BOT_PASSWORD", "")
 
@@ -81,6 +85,38 @@ STORE_ACCESS_TOKEN = os.environ.get("STORE_ACCESS_TOKEN", "True").lower() == "tr
 
 # Variable globale pour stocker le token d'accès Matrix
 global_access_token = None
+
+# Variables pour la gestion des rooms
+WEBHOOK_ROOM_IDS = []
+WEBHOOK_ROOM_MAP = {}
+WEBHOOK_INCOMING_ROOMS_CONFIG = {}
+
+# Variables pour Matrix
+matrix_access_token = None
+matrix_username = None  # Variable pour stocker le nom d'utilisateur au format normalisé
+last_sync_token = None
+
+# Variable pour le transfert automatique
+FORWARD_AUTOMATICALLY = os.environ.get("FORWARD_AUTOMATICALLY", "true").lower() == "true"
+
+# Variables pour le stockage d'état
+processed_events = set()  # Pour stocker les événements déjà traités
+processed_message_hashes = set()  # Pour stocker les hashes des messages déjà traités
+
+def is_room_configured(room_id):
+    """Vérifie si une salle est configurée pour le forwarding des messages"""
+    if not room_id:
+        return False
+        
+    # Vérifier si la salle est dans la configuration des webhooks
+    if room_id in WEBHOOK_ROOM_CONFIG:
+        return True
+        
+    # Vérifier si un webhook global est configuré et si le transfert automatique est activé
+    if GLOBAL_WEBHOOK_URL and GLOBAL_WEBHOOK_AUTO_FORWARD:
+        return True
+        
+    return False
 
 async def send_message_to_matrix(room_id, message_text, reply_to=None, thread_root=None, format_type=None):
     """
@@ -183,6 +219,21 @@ def filter_webhook_data(data):
     Filtre les données avant de les envoyer à n8n pour réduire la taille.
     Cette fonction permet d'optimiser les données transmises au webhook n8n.
     """
+    # Vérifier si on a déjà traité ce message (déduplication)
+    event_id = data.get("event_id", "")
+    if event_id:
+        # Limiter le nombre de tentatives d'envoi par message
+        if hasattr(filter_webhook_data, "processed_events") and event_id in filter_webhook_data.processed_events:
+            filter_webhook_data.processed_events[event_id] += 1
+            if filter_webhook_data.processed_events[event_id] > 3:  # Maximum 3 tentatives
+                logger.warning(f"Message {event_id} déjà traité 3 fois, abandon pour éviter une boucle")
+                return None
+            logger.info(f"Tentative {filter_webhook_data.processed_events[event_id]} pour le message {event_id}")
+        else:
+            if not hasattr(filter_webhook_data, "processed_events"):
+                filter_webhook_data.processed_events = {}
+            filter_webhook_data.processed_events[event_id] = 1
+    
     if not WEBHOOK_SIMPLIFY_PAYLOAD:
         # Si la simplification est désactivée, renvoyer toutes les données
         return data
@@ -297,6 +348,25 @@ async def send_webhook(url, data, method="POST"):
     Envoie les données webhooks à n8n en utilisant notre filtre pour réduire la taille.
     Par défaut, utilise la méthode POST pour garantir que tous les paramètres sont correctement transmis.
     """
+    # Éviter les duplications d'envoi
+    event_id = data.get("event_id", "")
+    if event_id:
+        # Utiliser un attribut statique pour suivre les tentatives d'envoi
+        if not hasattr(send_webhook, "sent_events"):
+            send_webhook.sent_events = {}
+            
+        # Vérifier si on a déjà envoyé cet événement à cette URL
+        event_url_key = f"{event_id}:{url}"
+        if event_url_key in send_webhook.sent_events:
+            send_webhook.sent_events[event_url_key] += 1
+            # Limiter à 2 tentatives par URL (pour permettre les réessais en cas d'échec)
+            if send_webhook.sent_events[event_url_key] > 2:
+                logger.warning(f"Message {event_id} déjà envoyé 2 fois à {url}, abandon pour éviter une boucle")
+                return False
+            logger.info(f"Nouvelle tentative ({send_webhook.sent_events[event_url_key]}) d'envoi de {event_id} à {url}")
+        else:
+            send_webhook.sent_events[event_url_key] = 1
+            
     logger.info(f"Préparation envoi webhook ({method}) vers {url}")
     
     # Détecter le type de webhook pour adapter le format
@@ -544,124 +614,173 @@ async def send_webhook(url, data, method="POST"):
         return False
 
 async def handle_matrix_event(request):
-    """Gère les événements Matrix (webhooks entrants)"""
+    """Gère les événements provenant de Matrix"""
     try:
-        logger.info(f"Traitement d'une requête Matrix: {request.method} {request.path}")
-        logger.debug(f"En-têtes de la requête: {dict(request.headers)}")
+        # Récupérer les données JSON
+        data = await request.json()
         
-        # Extraire les données de la requête
-        data = {}
-        request_text = None
+        # Débogage des événements entrants
+        event_type = data.get("type", "unknown")
+        sender = data.get("sender", "unknown")
+        event_id = data.get("event_id", "unknown")
+        room_id = data.get("room_id", "unknown")
         
-        if request.method == "GET":
-            data = dict(request.query)
-            logger.info(f"Requête GET reçue avec {len(data)} paramètres")
-        else:
-            # Essayer plusieurs formats possibles
-            try:
-                request_text = await request.text()
-                logger.debug(f"Corps de la requête brut: {request_text[:500]}{'...' if len(request_text) > 500 else ''}")
-                
-                try:
-                    # Essayer d'abord comme JSON
-                    data = await request.json()
-                    logger.info("Requête traitée comme JSON")
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Échec du parsing JSON: {str(e)}")
-                    
-                    # Essayer comme form data
-                    try:
-                        form_data = await request.post()
-                        data = dict(form_data)
-                        logger.info("Requête traitée comme form data")
-                    except Exception as form_err:
-                        logger.warning(f"Échec du parsing form data: {str(form_err)}")
-                        
-                        # Dernier recours: traiter comme texte brut
-                        if request_text:
-                            try:
-                                # Essayer de parser le texte comme JSON
-                                data = json.loads(request_text)
-                                logger.info("Requête texte brut traitée comme JSON")
-                            except json.JSONDecodeError:
-                                # Créer un dictionnaire avec le texte brut
-                                data = {"raw_text": request_text}
-                                logger.info("Requête traitée comme texte brut")
-            except Exception as general_err:
-                logger.error(f"Erreur générale lors de l'extraction des données: {str(general_err)}")
-                data = {"error": "Impossible d'extraire les données de la requête"}
+        logger.debug(f"Événement Matrix reçu - type: {event_type}, sender: {sender}, room: {room_id}, event_id: {event_id}")
         
-        logger.info(f"Événement Matrix reçu avec {len(data)} champs")
+        # Si ce n'est pas un message de salle, ignorer
+        if event_type != "m.room.message":
+            logger.debug(f"Événement ignoré (type non géré): {event_type}")
+            return web.json_response({"status": "ignored", "reason": "not a room message"})
         
-        # Vérifier si les données sont vides
-        if not data:
-            logger.warning("Aucune donnée extraite de la requête")
-            return web.json_response({"success": False, "error": "No data received"})
+        # Vérifier si l'ID de la salle est configuré pour recevoir des messages
+        if not is_room_configured(room_id):
+            logger.debug(f"Message ignoré: salle {room_id} non configurée pour les webhooks")
+            return web.json_response({"status": "ignored", "reason": "room not configured"})
+        
+        # IMPORTANT: Vérifier si c'est un message du bot lui-même
+        # Si le sender est le bot lui-même, ne pas traiter pour éviter les boucles
+        expected_bot_id = f"@{MATRIX_USERNAME}:{MATRIX_HOMESERVER.split('//')[1]}"
+        if sender == expected_bot_id:
+            logger.info(f"Message envoyé par le bot lui-même ({sender}), ignoré pour éviter une boucle.")
+            return web.json_response({"status": "ignored", "reason": "sent by bot"})
+        
+        # Vérifier si l'event_id a déjà été traité
+        if event_id in processed_events:
+            logger.info(f"Événement déjà traité (event_id: {event_id}), ignoré")
+            return web.json_response({"status": "ignored", "reason": "duplicate event"})
+        
+        # Ajouter l'event_id aux événements traités
+        processed_events.add(event_id)
+        
+        # Limiter la taille du set pour éviter une fuite mémoire
+        if len(processed_events) > 1000:
+            # Garder seulement les 500 plus récents
+            events_list = list(processed_events)
+            processed_events.clear()
+            processed_events.update(set(events_list[-500:]))
+            logger.debug(f"Nettoyage des événements traités, {len(events_list) - 500} supprimés")
+        
+        # Extraire le contenu du message
+        content = data.get("content", {})
+        message_type = content.get("msgtype", "")
+        body = content.get("body", "")
+        
+        # Vérifier si le contenu du message a déjà été traité (détection de boucle par contenu)
+        if body:
+            # Créer un hash MD5 du contenu du message
+            content_hash = hashlib.md5(body.encode('utf-8')).hexdigest()
             
-        # Afficher le type de données reçues
-        logger.debug(f"Type de données reçues: {type(data)}")
-        logger.debug(f"Clés présentes dans les données: {list(data.keys())}")
+            # Vérifier si le hash existe déjà dans les messages traités
+            if content_hash in processed_message_hashes:
+                logger.info(f"Contenu du message déjà traité (hash: {content_hash}), ignoré pour éviter une boucle")
+                return web.json_response({"status": "ignored", "reason": "duplicate content"})
+            
+            # Ajouter le hash aux contenus traités
+            processed_message_hashes.add(content_hash)
+            
+            # Limiter la taille du set pour éviter une fuite mémoire
+            if len(processed_message_hashes) > 1000:
+                # Garder seulement les 500 plus récents
+                hashes_list = list(processed_message_hashes)
+                processed_message_hashes.clear()
+                processed_message_hashes.update(set(hashes_list[-500:]))
+                logger.debug(f"Nettoyage des hashes de messages, {len(hashes_list) - 500} supprimés")
+
+        # Ne traiter que les messages texte
+        if message_type != "m.text":
+            logger.debug(f"Message ignoré (type non géré): {message_type}")
+            return web.json_response({"status": "ignored", "reason": "not a text message"})
         
-        try:
-            # Afficher les données complètes reçues (en mode debug)
-            logger.debug(f"Données complètes reçues: {json.dumps(data, indent=2, default=str)}")
-        except Exception as e:
-            logger.warning(f"Impossible de sérialiser les données en JSON: {str(e)}")
+        # Si c'est une commande spéciale, la traiter directement
+        if body.strip() == "!webhook":
+            room_webhook = get_webhook_url_for_room(room_id)
+            response_msg = f"URL du webhook pour cette salle: {room_webhook}"
+            await send_message_to_matrix(room_id, response_msg)
+            return web.json_response({"status": "success", "command": "webhook"})
         
-        # Extraire et logger les informations importantes
-        event_type = data.get("event", "message")
-        room_id = data.get("room_id", "")
-        sender = data.get("sender", "")
-        message = data.get("message", "")
-        
-        logger.info(f"Message reçu dans le salon {room_id or 'inconnu'} de {sender or 'inconnu'}")
-        logger.info(f"Type d'événement: {event_type}")
-        logger.info(f"Contenu du message: {message[:100]}{'...' if len(message) > 100 else ''}")
-        
-        # Journaliser d'autres métadonnées si disponibles
-        if "timestamp" in data:
-            logger.debug(f"Horodatage du message: {data['timestamp']}")
-        if "event_id" in data:
-            logger.debug(f"ID de l'événement: {data['event_id']}")
-        
-        # Vérifier si une configuration spécifique existe pour cette salle
-        if room_id and room_id in WEBHOOK_ROOM_CONFIG:
-            config = WEBHOOK_ROOM_CONFIG[room_id]
-            if isinstance(config, dict):
-                target_url = config.get("url", "")
-                method = config.get("method", "GET")
-            else:
-                # Format simplifié (juste l'URL)
-                target_url = config
-                method = "GET"
+        # Traitement de la commande !tools si nécessaire
+        if body and (body.strip() == "!tools" or body.startswith("!tools ")):
+            logger.info(f"Commande !tools détectée, transmission à /webhook/tool_agent")
+            
+            # Rediriger la requête vers /webhook/tool_agent
+            try:
+                # Construire l'URL pour l'endpoint tool_agent
+                base_url = f"http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/webhook/tool_agent"
                 
-            if target_url:
-                logger.info(f"Envoi de l'événement à l'URL spécifique pour la salle {room_id}: {target_url}")
-                logger.debug(f"Méthode utilisée: {method}")
-                success = await send_webhook(target_url, data, method)
-                logger.info(f"Résultat de l'envoi au webhook spécifique: {'succès' if success else 'échec'}")
-                return web.json_response({"success": success})
-        elif room_id:
-            logger.info(f"Aucune configuration spécifique trouvée pour la salle {room_id}")
-        else:
-            logger.warning("Aucun identifiant de salon trouvé dans les données")
+                # Préparer les données pour la requête à /webhook/tool_agent
+                tool_agent_data = data.copy()
+                
+                logger.info(f"Transmission de la commande !tools à {base_url}")
+                
+                # Faire une requête interne à /webhook/tool_agent
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(base_url, json=tool_agent_data) as response:
+                        status = response.status
+                        content = await response.text()
+                        
+                        logger.info(f"Réponse de tool_agent: {status}")
+                        
+                        if status == 200:
+                            try:
+                                json_response = json.loads(content)
+                                output_text = json_response.get('output', '')
+                                
+                                # Envoyer directement la réponse à Matrix
+                                if output_text:
+                                    await send_message_to_matrix(room_id, output_text, reply_to=event_id, format_type="markdown")
+                                    logger.info(f"Réponse à !tools envoyée avec succès à Matrix")
+                                else:
+                                    logger.warning(f"Réponse vide de /webhook/tool_agent")
+                            except Exception as e:
+                                logger.error(f"Erreur lors du traitement de la réponse: {str(e)}")
+                        else:
+                            logger.error(f"Erreur de /webhook/tool_agent: {status} - {content}")
+                
+                return web.json_response({"status": "success", "message": "Commande !tools transmise à tool_agent"})
+                
+            except Exception as e:
+                logger.error(f"Erreur lors de la transmission de la commande !tools: {str(e)}")
+                logger.error(traceback.format_exc())
+                return web.json_response({"error": str(e)}, status=500)
+                
+        # Valider le token si configuré
+        token = data.get("token", "")
+        if WEBHOOK_TOKEN and token != WEBHOOK_TOKEN:
+            logger.warning(f"Token webhook invalide: {token}")
+            return web.json_response({"error": "Token invalide"}, status=401)
         
-        # Si pas de config spécifique, utiliser le webhook global
-        if GLOBAL_WEBHOOK_AUTO_FORWARD and GLOBAL_WEBHOOK_URL:
-            logger.info(f"Envoi de l'événement au webhook global: {GLOBAL_WEBHOOK_URL}")
-            logger.debug(f"Méthode utilisée pour le webhook global: {GLOBAL_WEBHOOK_METHOD}")
-            success = await send_webhook(GLOBAL_WEBHOOK_URL, data, GLOBAL_WEBHOOK_METHOD)
-            logger.info(f"Résultat de l'envoi au webhook global: {'succès' if success else 'échec'}")
-            return web.json_response({"success": success})
+        # Récupérer l'ID de la salle
+        room_id = data.get("room_id", "")
+        if not room_id:
+            logger.warning("room_id manquant dans les données du webhook")
+            return web.json_response({"error": "room_id manquant"}, status=400)
         
-        logger.warning("Aucun webhook configuré pour ce message, il ne sera pas transmis")
-        return web.json_response({"success": False, "error": "No webhook configured"})
-    
+        # Récupérer le contenu du message
+        if not body:
+            logger.warning("Message manquant dans les données du webhook")
+            return web.json_response({"error": "Message manquant"}, status=400)
+        
+        # Autres données optionnelles
+        format_type = data.get("format", "markdown")
+        reply_to = data.get("reply_to", None)
+        
+        # Transmettre à n8n si automatiquement configuré
+        if GLOBAL_WEBHOOK_AUTO_FORWARD and room_id in WEBHOOK_ROOM_CONFIG:
+            await handle_matrix_message(data)
+        
+        # Envoyer le message à Matrix
+        event_id = await send_message_to_matrix(room_id, body, reply_to=reply_to, format_type=format_type)
+        if event_id:
+            # Ajouter le nouvel event_id à la liste des messages traités
+            processed_events.add(event_id)
+            logger.info(f"Nouveau message envoyé avec ID {event_id}, ajouté aux messages traités")
+        
+        return web.json_response({"success": True})
+        
     except Exception as e:
-        logger.error(f"Erreur lors du traitement de l'événement Matrix: {str(e)}")
-        import traceback
-        logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
-        return web.json_response({"success": False, "error": str(e)})
+        logger.error(f"Erreur lors du traitement du webhook: {str(e)}")
+        logger.error(traceback.format_exc())
+        return web.json_response({"error": str(e)}, status=500)
 
 async def handle_n8n_webhook(request):
     """Gère les webhooks venant de n8n (webhooks entrants)"""
@@ -878,354 +997,965 @@ async def send_welcome_message_to_rooms():
     if not success:
         logger.error("Échec de connexion avec tous les formats d'identifiants testés")
 
-async def process_matrix_message(room_id, event_id, sender, message_text, msg_type="m.room.message", reply_to=None, thread_root=None):
+def determine_webhook_urls(room_id: str) -> List[str]:
     """
-    Traite un message Matrix et l'envoie au webhook n8n avec des informations enrichies
+    Détermine les URLs des webhooks à appeler pour une salle donnée.
     
     Args:
-        room_id: ID du salon Matrix
-        event_id: ID de l'événement Matrix
-        sender: Expéditeur du message
-        message_text: Texte du message
-        msg_type: Type de message Matrix
-        reply_to: ID de l'événement auquel ce message répond
-        thread_root: ID de l'événement racine du fil de discussion
+        room_id: ID de la salle
+        
+    Returns:
+        Liste des URLs des webhooks à appeler
     """
-    global global_access_token
+    urls = []
     
-    logger.info(f"Traitement d'un message Matrix du salon {room_id} de {sender}, event_id: {event_id}")
-    
-    # Identifier le token associé à ce salon pour la réponse
-    token = None
-    for t, rid in WEBHOOK_INCOMING_ROOMS_CONFIG.items():
-        if rid == room_id:
-            token = t
-            break
-    
-    # Vérifier que l'event_id est valide
-    if not event_id:
-        logger.warning("Aucun event_id valide fourni pour ce message")
-        event_id = f"unknown_{int(asyncio.get_event_loop().time())}"
-    
-    # Déterminer le type d'événement réel (pas seulement l'ID)
-    event_type = "m.room.message"  # Par défaut
-    
-    # On initialise avec des valeurs par défaut
-    event_context = {
-        "room_name": "",
-        "sender_display_name": "",
-        "parent_message": "",
-        "is_direct_chat": False
-    }
-    
-    # Si l'API Matrix est activée et qu'on a stocké le token d'accès, on peut enrichir les données
-    if MATRIX_API_ENABLED and global_access_token and (STORE_ACCESS_TOKEN or reply_to):
-        try:
-            logger.info("Récupération du contexte enrichi pour le message")
-            event_context = await fetch_matrix_event_context(global_access_token, event_id, room_id, reply_to)
-            logger.debug(f"Contexte récupéré: {json.dumps(event_context, indent=2)}")
-        except Exception as e:
-            logger.warning(f"Erreur lors de la récupération du contexte enrichi: {str(e)}")
-    
-    # Préparer les données à envoyer à n8n de manière enrichie
-    data = {
-        "event": event_type,
-        "room_id": room_id,
-        "event_id": event_id,
-        "original_event_id": event_id,  # Ajout explicite pour que n8n puisse facilement récupérer cet ID
-        "sender": sender,
-        "message": message_text,
-        "chatInput": message_text,  # Ajout pour compatibilité avec n8n existant
-        "message_type": msg_type,
-        "timestamp": str(asyncio.get_event_loop().time()),
-        "format": "markdown",  # Ajouter markdown comme format par défaut
-        
-        # Informations enrichies pour la structure hiérarchique
-        "room_name": event_context["room_name"],
-        "is_direct_chat": event_context["is_direct_chat"],
-        "sender_display_name": event_context["sender_display_name"],
-        "parent_message": event_context["parent_message"],
-        "event_type": event_type,
-        
-        # Ajouter la liste des workflows disponibles pour l'agent
-        "available_workflows": AVAILABLE_WORKFLOWS
-    }
-    
-    # Ajouter des informations sur les fils de discussion
-    if thread_root:
-        data["is_threaded"] = True
-    else:
-        data["is_threaded"] = False
-    
-    # Ajouter les informations de relation si présentes
-    if reply_to:
-        data["reply_to"] = reply_to
-    
-    if thread_root:
-        data["thread_root"] = thread_root
-    
-    if token:
-        data["response_token"] = token
-    
-    # Afficher les données brutes pour le débogage
-    logger.debug(f"Données avant filtrage: {json.dumps(data, indent=2)}")
-    
-    # Envoyer au webhook spécifique pour ce salon s'il existe
-    success_any = False
+    # Vérifier si une configuration spécifique existe pour cette salle
     if room_id in WEBHOOK_ROOM_CONFIG:
         config = WEBHOOK_ROOM_CONFIG[room_id]
         if isinstance(config, dict):
             target_url = config.get("url", "")
-            method = config.get("method", "POST")  # Utiliser POST par défaut
         else:
             # Format simplifié (juste l'URL)
             target_url = config
-            method = "POST"  # Utiliser POST par défaut
             
         if target_url:
-            # Vérifier si nous avons plusieurs URLs séparées par des virgules
+            # Gérer les URLs multiples séparées par des virgules
             if "," in target_url:
-                target_urls = [url.strip() for url in target_url.split(",")]
-                logger.info(f"Détection de {len(target_urls)} URLs pour le salon {room_id}")
-                
-                for url in target_urls:
-                    logger.info(f"Envoi du message à l'URL spécifique pour la salle {room_id}: {url}")
-                    success = await send_webhook(url, data, method)
-                    logger.info(f"Résultat de l'envoi au webhook {url}: {'succès' if success else 'échec'}")
-                    success_any = success_any or success
-                
-                return success_any
+                for url in target_url.split(","):
+                    clean_url = url.strip()
+                    if clean_url and clean_url not in urls:  # Éviter les doublons
+                        urls.append(clean_url)
             else:
-                logger.info(f"Envoi du message à l'URL spécifique pour la salle {room_id}: {target_url}")
-                success = await send_webhook(target_url, data, method)
-                logger.info(f"Résultat de l'envoi au webhook spécifique: {'succès' if success else 'échec'}")
-                return success
+                clean_url = target_url.strip()
+                if clean_url and clean_url not in urls:  # Éviter les doublons
+                    urls.append(clean_url)
     
-    # Sinon, utiliser le webhook global
-    if GLOBAL_WEBHOOK_AUTO_FORWARD and GLOBAL_WEBHOOK_URL:
-        # Vérifier si nous avons plusieurs URLs séparées par des virgules
-        if "," in GLOBAL_WEBHOOK_URL:
-            target_urls = [url.strip() for url in GLOBAL_WEBHOOK_URL.split(",")]
-            logger.info(f"Détection de {len(target_urls)} URLs pour le webhook global")
-            
-            for url in target_urls:
-                logger.info(f"Envoi du message au webhook global: {url}")
-                success = await send_webhook(url, data, GLOBAL_WEBHOOK_METHOD)
-                logger.info(f"Résultat de l'envoi au webhook {url}: {'succès' if success else 'échec'}")
-                success_any = success_any or success
-            
-            return success_any
-        else:
-            logger.info(f"Envoi du message au webhook global: {GLOBAL_WEBHOOK_URL}")
-            success = await send_webhook(GLOBAL_WEBHOOK_URL, data, GLOBAL_WEBHOOK_METHOD)
-            logger.info(f"Résultat de l'envoi au webhook global: {'succès' if success else 'échec'}")
-            return success
-    
-    logger.warning("Aucun webhook configuré pour ce message, il ne sera pas transmis")
-    return False
+    # Si pas de config spécifique, utiliser le webhook global
+    if not urls and GLOBAL_WEBHOOK_URL:
+        urls.append(GLOBAL_WEBHOOK_URL)
+        
+    return urls
 
-async def setup_matrix_listener():
-    """Configure un écouteur pour les messages Matrix et les renvoie vers n8n"""
-    global global_access_token
+async def handle_matrix_message(data: Dict[str, Any]) -> bool:
+    """
+    Traite un message Matrix et l'envoie au service approprié (MCP si n8n est désactivé)
     
-    if not MATRIX_HOMESERVER or not MATRIX_USERNAME or not MATRIX_PASSWORD:
-        logger.warning("Configuration Matrix incomplète, impossible de configurer l'écouteur de messages")
+    Args:
+        data: Données du message
+    
+    Returns:
+        bool: True si le message a été envoyé avec succès, False sinon
+    """
+    # Vérifier si N8N est activé 
+    n8n_enabled = os.environ.get("N8N_ENABLED", "").lower() == "true"
+    mcp_enabled = os.environ.get("MCP_REGISTRY_URL", "") != ""
+
+    # Obtenir l'ID du salon
+    room_id = data.get("room_id", "")
+    
+    # Ignorer les messages du bot lui-même pour éviter les boucles
+    sender = data.get("sender", "")
+    if matrix_username and sender == matrix_username:
+        logger.debug(f"Ignorer message du bot lui-même: {data.get('event_id', '')}")
         return False
     
+    # Log pour debug
+    logger.debug(f"Réception d'un message de {sender} dans le salon {room_id}")
+
+    # Si n8n est désactivé et MCP est activé, utiliser MCP
+    if not n8n_enabled and mcp_enabled:
+        logger.debug("n8n est désactivé, utilisation de MCP à la place")
+        return await handle_message_via_mcp(data)
+    # Si n8n est toujours activé, utiliser le webhook traditionnel
+    elif n8n_enabled:
+        # Déterminer les URLs de webhook pour ce salon
+        webhook_urls = determine_webhook_urls(room_id)
+        
+        if not webhook_urls:
+            # Aucun webhook configuré pour ce salon et pas de webhook global ou transfert auto désactivé
+            logger.debug(f"Aucun webhook configuré pour le salon {room_id}")
+            return False
+            
+        # Filtrer les données avant de les envoyer (simplifier le payload)
+        filtered_data = filter_webhook_data(data)
+        if not filtered_data:
+            logger.debug(f"Message filtré, non envoyé: {data.get('event_id', '')}")
+            return False
+        
+        # Envoyer le message à chaque webhook configuré
+        success = False
+        for url in webhook_urls:
+            try:
+                logger.info(f"Envoi du message au webhook pour le salon {room_id}")
+                result = await send_webhook(url, filtered_data, method=GLOBAL_WEBHOOK_METHOD)
+                if result:
+                    success = True
+            except Exception as e:
+                logger.error(f"Erreur lors de l'envoi au webhook {url}: {str(e)}")
+        
+        return success
+    else:
+        logger.info("n8n et MCP sont tous deux désactivés, le message ne sera pas transmis")
+        return False
+
+async def handle_message_via_mcp(data: Dict[str, Any]) -> bool:
+    """
+    Envoie un message à MCP au lieu de n8n
+    
+    Args:
+        data: Données du message
+    
+    Returns:
+        bool: True si le message a été envoyé avec succès, False sinon
+    """
     try:
-        # 1. S'authentifier d'abord pour obtenir un token
+        # Configuration MCP
+        mcp_registry_url = os.environ.get("MCP_REGISTRY_URL", "")
+        mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
+        
+        if not mcp_registry_url:
+            logger.error("URL du registre MCP non configurée")
+            return False
+        
+        # Préparer les données pour MCP
+        mcp_data = {
+            "message": data.get("message", "") or data.get("content", {}).get("body", ""),
+            "sender": data.get("sender", ""),
+            "room_id": data.get("room_id", ""),
+            "event_id": data.get("event_id", ""),
+            "timestamp": data.get("timestamp", str(time.time())),
+            "is_reply": bool(data.get("reply_to", "")),
+            "reply_to": data.get("reply_to", ""),
+            "is_threaded": data.get("is_threaded", False),
+            "thread_root": data.get("thread_root", ""),
+            "source": "matrix"
+        }
+        
+        # Tester si le message est une commande, et si oui, la traiter localement 
+        # plutôt que d'essayer de l'envoyer à MCP qui n'est peut-être pas configuré
+        message = mcp_data.get("message", "")
+        if message and message.startswith("!"):
+            logger.info(f"Message détecté comme commande: {message[:20]}... - à traiter localement")
+            return False  # Laisser le système de commandes intégré traiter cette commande
+        
+        # Envoyer à MCP
         async with aiohttp.ClientSession() as session:
-            login_url = f"{MATRIX_HOMESERVER}/_matrix/client/r0/login"
-            login_data = {
-                "type": "m.login.password",
-                "user": MATRIX_USERNAME,
-                "password": MATRIX_PASSWORD
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {mcp_auth_token}" if mcp_auth_token else ""
             }
             
-            logger.info(f"Tentative de connexion à {MATRIX_HOMESERVER} pour configurer l'écouteur")
-            async with session.post(login_url, json=login_data) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"Échec de connexion à Matrix pour l'écouteur: {response.status} - {error_text}")
-                    return False
+            logger.info(f"Envoi du message à MCP pour le salon {data.get('room_id', '')}")
+            
+            # Liste des endpoints à essayer
+            endpoints = [
+                "/webhooks/matrix",
+                "/api/webhooks/matrix", 
+                "/api/messages",
+                "/v1/messages", 
+                "/webhooks/messages",
+                "/api/v1/matrix"
+            ]
+            
+            # Essayer chaque endpoint
+            for endpoint in endpoints:
+                url = f"{mcp_registry_url.rstrip('/')}{endpoint}"
                 
-                login_response = await response.json()
-                access_token = login_response.get("access_token")
-                user_id = login_response.get("user_id")
-                
-                if not access_token:
-                    logger.error("Pas de token d'accès dans la réponse Matrix")
-                    return False
-                
-                # Stocker le token d'accès pour l'enrichissement des données
-                if STORE_ACCESS_TOKEN:
-                    global_access_token = access_token
-                    logger.info("Token d'accès Matrix enregistré pour l'enrichissement des données")
-                
-                logger.info(f"Connexion à Matrix réussie pour l'écouteur (user_id: {user_id})")
-        
-        # Stocker les IDs des messages déjà traités pour éviter les doublons
-        processed_events = set()
-        
-        # Stocker le timestamps de démarrage pour ignorer les anciens messages
-        start_timestamp = asyncio.get_event_loop().time()
-        logger.info(f"Timestamp de démarrage: {start_timestamp}")
-        
-        # 2. Configurer l'écouteur en utilisant le polling sync
-        async def sync_loop(access_token, bot_user_id):
-            nonlocal start_timestamp
-            next_batch = None  # Commencer sans "since" pour obtenir uniquement les nouveaux messages
-            first_sync = True
-            
-            # Faire un premier sync pour marquer où on commence (sans traiter les messages)
-            sync_url = f"{MATRIX_HOMESERVER}/_matrix/client/r0/sync"
-            headers = {"Authorization": f"Bearer {access_token}"}
-            
-            try:
-                async with aiohttp.ClientSession() as init_session:
-                    async with init_session.get(sync_url, headers=headers) as sync_response:
-                        if sync_response.status == 200:
-                            sync_data = await sync_response.json()
-                            next_batch = sync_data.get("next_batch")
-                            logger.info(f"Synchronisation initiale réussie, token: {next_batch}")
-                            
-                            # Stocker tous les événements existants comme déjà traités
-                            rooms = sync_data.get("rooms", {}).get("join", {})
-                            for room_id, room_data in rooms.items():
-                                timeline = room_data.get("timeline", {})
-                                events = timeline.get("events", [])
-                                for event in events:
-                                    event_id = event.get("event_id")
-                                    if event_id:
-                                        processed_events.add(event_id)
-                                        logger.debug(f"Événement initial marqué comme traité: {event_id}")
-                            
-                            logger.info(f"Nombre d'événements initiaux ignorés: {len(processed_events)}")
-                        else:
-                            logger.error(f"Erreur lors de la synchronisation initiale: {sync_response.status}")
-            except Exception as e:
-                logger.error(f"Erreur lors de la synchronisation initiale: {e}")
-            
-            logger.info("Démarrage de l'écouteur de messages (ignorant les messages antérieurs)")
-            
-            # Attendre un court délai pour s'assurer que les messages de bienvenue sont traités
-            await asyncio.sleep(5)
-            
-            while True:
                 try:
-                    # Créer une nouvelle session pour chaque itération
-                    async with aiohttp.ClientSession() as session:
-                        # Construire l'URL de sync
-                        params = {"timeout": 30000}
-                        if next_batch:
-                            params["since"] = next_batch
-                        
-                        headers = {"Authorization": f"Bearer {access_token}"}
-                        
-                        async with session.get(sync_url, params=params, headers=headers) as sync_response:
-                            if sync_response.status != 200:
-                                logger.error(f"Erreur lors du sync: {sync_response.status}")
-                                await asyncio.sleep(5)  # Attente avant de réessayer
-                                continue
+                    async with session.post(url, json=mcp_data, headers=headers) as response:
+                        if response.status == 200 or response.status == 202:
+                            response_data = await response.json()
+                            logger.info(f"Message envoyé avec succès à MCP via {endpoint}: {response_data.get('id', '')}")
                             
-                            sync_data = await sync_response.json()
-                            next_batch = sync_data.get("next_batch")
-                            
-                            # Traiter les événements de salle
-                            rooms = sync_data.get("rooms", {}).get("join", {})
-                            for room_id, room_data in rooms.items():
-                                timeline = room_data.get("timeline", {})
-                                events = timeline.get("events", [])
+                            # Mémoriser l'endpoint qui a fonctionné pour optimiser les futurs appels
+                            if hasattr(handle_message_via_mcp, "working_endpoint"):
+                                handle_message_via_mcp.working_endpoint = endpoint
+                            else:
+                                setattr(handle_message_via_mcp, "working_endpoint", endpoint)
                                 
-                                for event in events:
-                                    # Ignorer les messages déjà traités
-                                    event_id = event.get("event_id")
-                                    if event_id in processed_events:
-                                        continue
-                                    
-                                    # Ajouter l'événement aux événements traités
-                                    processed_events.add(event_id)
-                                    
-                                    # Vérifier l'horodatage de l'événement s'il est disponible
-                                    event_ts = event.get("origin_server_ts", 0)
-                                    if event_ts and event_ts/1000 < start_timestamp:
-                                        logger.debug(f"Ignorer événement antérieur au démarrage: {event_id}")
-                                        continue
-                                    
-                                    # Ignorer les messages de bienvenue du bot pendant la première synchronisation
-                                    if first_sync and event.get("type") == "m.room.message":
-                                        content = event.get("content", {})
-                                        message = content.get("body", "")
-                                        if "Je suis en ligne et prêt à vous aider" in message:
-                                            logger.info(f"Ignorer message de bienvenue: {event_id}")
-                                            continue
-                                    
-                                    # Maintenir la taille de l'ensemble des événements traités (limiter la mémoire)
-                                    if len(processed_events) > 1000:
-                                        # Garder uniquement les 500 derniers événements
-                                        processed_events_list = list(processed_events)
-                                        processed_events.clear()
-                                        processed_events.update(processed_events_list[-500:])
-                                    
-                                    # Ne traiter que les messages texte
-                                    if event.get("type") == "m.room.message" and event.get("content", {}).get("msgtype") == "m.text":
-                                        sender = event.get("sender", "")
-                                        
-                                        # Ignorer les messages envoyés par le bot lui-même
-                                        if sender == bot_user_id:
-                                            logger.debug(f"Ignorer message du bot lui-même: {event_id}")
-                                            continue
-                                        
-                                        content = event.get("content", {})
-                                        message = content.get("body", "")
-                                        
-                                        # Extraire les informations de relation (réponse à, fil de discussion)
-                                        relates_to = content.get("m.relates_to", {})
-                                        reply_to = relates_to.get("m.in_reply_to", {}).get("event_id")
-                                        thread_root = None
-                                        
-                                        if "rel_type" in relates_to and relates_to.get("rel_type") == "m.thread":
-                                            thread_root = relates_to.get("event_id")
-                                        
-                                        if message and event_id:
-                                            # Transmettre le message à n8n via le webhook
-                                            await process_matrix_message(
-                                                room_id, 
-                                                event_id, 
-                                                sender, 
-                                                message, 
-                                                reply_to=reply_to, 
-                                                thread_root=thread_root
-                                            )
-                            
-                            # Marquer que la première synchronisation est terminée
-                            if first_sync:
-                                first_sync = False
-                                logger.info("Première synchronisation terminée")
-                
+                            return True
+                        elif response.status == 404:
+                            error_text = await response.text()
+                            logger.warning(f"Endpoint {endpoint} non trouvé: {response.status} - {error_text[:100]}...")
+                            # Continuer avec le prochain endpoint
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"Échec d'envoi du message à MCP via {endpoint}: {response.status} - {error_text[:100]}...")
+                            # Si on reçoit une erreur autre que 404, c'est probablement une erreur d'authentification
+                            # ou une erreur de format, donc inutile d'essayer les autres endpoints
+                            if response.status != 404:
+                                return False
                 except Exception as e:
-                    logger.error(f"Erreur dans la boucle de sync: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    await asyncio.sleep(5)  # Attente avant de réessayer
-        
-        # Démarrer la boucle de sync dans une tâche asyncio avec le token
-        asyncio.create_task(sync_loop(global_access_token, user_id))
-        logger.info("Écouteur Matrix configuré et démarré")
-        return True
+                    logger.error(f"Erreur lors de la connexion à l'endpoint {endpoint}: {str(e)}")
+                    continue
+            
+            # Si on arrive ici, c'est qu'aucun endpoint n'a fonctionné
+            logger.warning("Aucun endpoint MCP n'est disponible. MCP est peut-être mal configuré ou non démarré.")
+            logger.info("Le message n'a pas pu être transmis à MCP. Assurez-vous que le service MCP est correctement configuré et actif.")
+            return False
                 
     except Exception as e:
-        logger.error(f"Erreur lors de la configuration de l'écouteur Matrix: {str(e)}")
+        logger.error(f"Erreur lors de l'envoi du message à MCP: {str(e)}")
+        import traceback
+        logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
+        return False
+
+async def process_matrix_sync(events, bot_user_id):
+    """Traite les événements de synchronisation Matrix et les transmet à n8n ou Albert"""
+    global pending_events
+    
+    # Parcourir tous les nouveaux événements
+    for event in events:
+        if event.get("type") != "m.room.message":
+            continue
+        
+        sender = event.get("sender", "")
+        if sender == bot_user_id:
+            logger.debug(f"Ignorer message du bot lui-même: {event.get('event_id', 'ID inconnu')}")
+            continue
+        
+        room_id = event.get("room_id", "")
+        
+        # Vérifier si c'est une commande
+        content = event.get("content", {})
+        body = content.get("body", "")
+        if body and body.startswith("!"):
+            logger.debug(f"Commande détectée, ne sera pas transmise: {body.split()[0]}")
+            continue
+        
+        # Préparer les données pour la transmission
+        data = {
+            "event_id": event.get("event_id", ""),
+            "sender": sender,
+            "room_id": room_id,
+            "message": body,
+            "content": content,
+            "timestamp": event.get("origin_server_ts", int(time.time() * 1000)),
+            "event_type": event.get("type", "")
+        }
+        
+        # Ajouter les informations du fil de discussion si disponibles
+        if "m.relates_to" in content:
+            relates_to = content["m.relates_to"]
+            if "m.in_reply_to" in relates_to:
+                data["reply_to"] = relates_to["m.in_reply_to"].get("event_id", "")
+            if relates_to.get("rel_type") == "m.thread":
+                data["is_threaded"] = True
+                data["thread_root"] = relates_to.get("event_id", "")
+        
+        # Enrichir avec les métadonnées Matrix si configuré
+        try:
+            # Traitement des messages selon la configuration
+            n8n_enabled = os.environ.get("N8N_ENABLED", "").lower() == "true"
+            
+            # Journalisation des informations de messages
+            logger.debug(f"Réception d'un message de {sender} dans le salon {room_id}")
+            
+            # Traitement selon la configuration
+            if n8n_enabled:
+                logger.debug("Traitement du message via n8n")
+                # Transmission à n8n si activé
+                success = await handle_matrix_message(data)
+                if not success:
+                    # Stocker l'événement pour réessayer plus tard
+                    pending_events.append(data)
+            else:
+                logger.debug("Traitement du message via Albert/MCP")
+                # Tous les messages sont traités par Albert, qui peut mobiliser MCP si nécessaire
+                await handle_message_via_albert(data)
+                
+        except Exception as e:
+            logger.error(f"Erreur lors du traitement du message: {str(e)}")
+            import traceback
+            logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
+
+async def handle_message_via_albert(data: Dict[str, Any]) -> bool:
+    """
+    Traite un message via l'API Albert en utilisant le MCP comme intermédiaire d'analyse d'intention.
+    
+    Le flux est le suivant:
+    1. Un message est reçu de Matrix/Tchap
+    2. Le MCP analyse l'intention du message
+    3. L'API Albert génère une réponse appropriée
+    4. La réponse est envoyée via Matrix/Tchap
+    
+    Args:
+        data: Données du message provenant de Matrix/Tchap
+    
+    Returns:
+        bool: True si le message a été traité avec succès, False sinon
+    """
+    try:
+        # Configuration MCP et Albert API
+        mcp_registry_url = os.environ.get("MCP_REGISTRY_URL", "")
+        mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
+        albert_api_url = os.environ.get("ALBERT_API_URL", "https://albert.api.etalab.gouv.fr")
+        albert_api_token = os.environ.get("ALBERT_API_TOKEN", mcp_auth_token)  # Utiliser le même token si ALBERT_API_TOKEN n'est pas défini
+        albert_model = os.environ.get("ALBERT_MODEL", "mixtral-8x7b-instruct-v0.1")  # Modèle par défaut
+        
+        if not mcp_registry_url:
+            logger.warning("URL du registre MCP non configurée, impossible d'analyser l'intention des messages")
+            return False
+        
+        # Message à traiter
+        message_content = data.get("message", "") or data.get("content", {}).get("body", "")
+        sender = data.get("sender", "")
+        room_id = data.get("room_id", "")
+        event_id = data.get("event_id", "")
+        
+        logger.info(f"Traitement du message de {sender} dans le salon {room_id}: {message_content[:50]}...")
+        
+        # 1. Analyse d'intention via MCP
+        mcp_intent_data = {
+            "message": message_content,
+            "sender": sender,
+            "room_id": room_id,
+            "event_id": event_id,
+            "source": "matrix",
+            "analyze_only": True  # Indique que nous voulons seulement l'analyse d'intention
+        }
+        
+        mcp_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {mcp_auth_token}" if mcp_auth_token else ""
+        }
+        
+        # Tenter l'analyse d'intention via MCP
+        mcp_intent_result = {}
+        async with aiohttp.ClientSession() as session:
+            # Essayer différents endpoints potentiels pour l'analyse d'intention
+            mcp_endpoints = [
+                "/api/analyze",
+                "/intent/analyze",
+                "/api/intent"
+            ]
+            
+            for endpoint in mcp_endpoints:
+                intent_url = f"{mcp_registry_url.rstrip('/')}{endpoint}"
+                try:
+                    async with session.post(intent_url, json=mcp_intent_data, headers=mcp_headers) as response:
+                        if response.status == 200:
+                            mcp_intent_result = await response.json()
+                            logger.info(f"Analyse d'intention réussie via {endpoint}")
+                            break
+                        elif response.status != 404:  # Si erreur autre que 404, ne pas continuer
+                            error_text = await response.text()
+                            logger.error(f"Échec d'analyse d'intention via {endpoint}: {response.status} - {error_text[:100]}...")
+                            break
+                except Exception as e:
+                    logger.error(f"Erreur lors de la connexion à {endpoint}: {str(e)}")
+            
+        # 2. Générer une réponse via l'API Albert
+        # Préparer le contexte basé sur l'analyse d'intention de MCP
+        requires_tool = mcp_intent_result.get("requires_tool", False)
+        tool_name = mcp_intent_result.get("tool_name", "")
+        tool_args = mcp_intent_result.get("tool_args", {})
+        
+        # Si un outil est requis, l'exécuter via MCP
+        tool_result = None
+        if requires_tool and tool_name:
+            logger.info(f"Exécution de l'outil '{tool_name}' requis par l'analyse d'intention")
+            mcp_tool_data = {
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "message_context": mcp_intent_data
+            }
+            
+            tool_url = f"{mcp_registry_url.rstrip('/')}/api/tools/execute"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(tool_url, json=mcp_tool_data, headers=mcp_headers) as response:
+                        if response.status == 200:
+                            tool_result = await response.json()
+                            logger.info(f"Exécution de l'outil '{tool_name}' réussie")
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"Échec d'exécution de l'outil '{tool_name}': {response.status} - {error_text[:100]}...")
+            except Exception as e:
+                logger.error(f"Erreur lors de l'exécution de l'outil '{tool_name}': {str(e)}")
+        
+        # 3. Appel à l'API Albert avec le contexte complet
+        # Messages préparés pour l'API Albert
+        messages = [
+            {"role": "user", "content": message_content}
+        ]
+        
+        # Ajouter les résultats de l'analyse d'intention et/ou de l'outil si disponibles
+        context = []
+        if mcp_intent_result:
+            context.append(f"Analyse d'intention: {json.dumps(mcp_intent_result, ensure_ascii=False)}")
+        if tool_result:
+            context.append(f"Résultat de l'outil '{tool_name}': {json.dumps(tool_result, ensure_ascii=False)}")
+        
+        if context:
+            messages.insert(0, {
+                "role": "system", 
+                "content": "Voici le contexte pour t'aider à répondre: " + " ".join(context)
+            })
+        
+        # Préparation de la requête pour l'API Albert
+        albert_data = {
+            "model": albert_model,  # Champ obligatoire selon l'API
+            "messages": messages,
+            "stream": False
+        }
+        
+        albert_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {albert_api_token}" if albert_api_token else ""
+        }
+        
+        # Appel à l'API Albert
+        async with aiohttp.ClientSession() as session:
+            albert_url = f"{albert_api_url}/chat/completions"  # URL correcte sans /v1/
+            
+            try:
+                logger.info(f"Appel à l'API Albert: {albert_url}")
+                async with session.post(albert_url, json=albert_data, headers=albert_headers) as response:
+                    if response.status == 200:
+                        response_data = await response.json()
+                        
+                        # Extraire la réponse d'Albert
+                        assistant_message = response_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        
+                        if assistant_message:
+                            # 4. Envoyer la réponse à Matrix/Tchap
+                            logger.info(f"Envoi de la réponse d'Albert au salon {room_id}")
+                            await send_message_to_matrix(
+                                room_id,
+                                assistant_message,
+                                reply_to=event_id
+                            )
+                            return True
+                        else:
+                            logger.error("Réponse vide de l'API Albert")
+                            return False
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Échec de l'appel à l'API Albert: {response.status} - {error_text[:100]}...")
+                        
+                        # Si l'API Albert échoue avec une erreur 422, essayer avec un autre modèle
+                        if response.status == 422:
+                            # Essayer avec d'autres modèles disponibles dans Albert
+                            logger.info("Tentative avec un autre modèle Albert")
+                            for fallback_model in ["mistral-7b-instruct-v0.2", "gpt-3.5-turbo"]:
+                                albert_data["model"] = fallback_model
+                                try:
+                                    async with session.post(albert_url, json=albert_data, headers=albert_headers) as fallback_response:
+                                        if fallback_response.status == 200:
+                                            fallback_data = await fallback_response.json()
+                                            fallback_message = fallback_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                                            
+                                            if fallback_message:
+                                                logger.info(f"Réponse générée avec succès via le modèle {fallback_model}")
+                                                await send_message_to_matrix(
+                                                    room_id,
+                                                    fallback_message,
+                                                    reply_to=event_id
+                                                )
+                                                return True
+                                        else:
+                                            fallback_error = await fallback_response.text()
+                                            logger.error(f"Échec avec le modèle {fallback_model}: {fallback_response.status} - {fallback_error[:100]}...")
+                                except Exception as e:
+                                    logger.error(f"Erreur lors de l'appel avec le modèle {fallback_model}: {str(e)}")
+                        
+                        # Si tous les appels à Albert échouent, envoyer une réponse par défaut
+                        default_message = "Je suis désolé, je n'ai pas pu traiter votre demande pour le moment. Notre service est en cours de maintenance. Veuillez réessayer ultérieurement."
+                        logger.info(f"Envoi d'une réponse par défaut au salon {room_id}")
+                        await send_message_to_matrix(
+                            room_id,
+                            default_message,
+                            reply_to=event_id
+                        )
+                        return True
+            except Exception as e:
+                logger.error(f"Erreur lors de l'appel à l'API Albert: {str(e)}")
+                import traceback
+                logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
+                
+                # En cas d'erreur, envoyer une réponse par défaut
+                default_message = "Je suis désolé, je n'ai pas pu traiter votre demande pour le moment. Notre service est en cours de maintenance. Veuillez réessayer ultérieurement."
+                logger.info(f"Envoi d'une réponse par défaut au salon {room_id}")
+                await send_message_to_matrix(
+                    room_id,
+                    default_message,
+                    reply_to=event_id
+                )
+                return True
+                
+    except Exception as e:
+        logger.error(f"Erreur lors du traitement du message via Albert: {str(e)}")
+        import traceback
+        logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
+        
+        try:
+            # En cas d'erreur, envoyer une réponse par défaut
+            default_message = "Je suis désolé, je n'ai pas pu traiter votre demande en raison d'une erreur technique. Notre équipe a été notifiée du problème."
+            logger.info(f"Envoi d'une réponse par défaut au salon {data.get('room_id', '')}")
+            await send_message_to_matrix(
+                data.get("room_id", ""),
+                default_message,
+                reply_to=data.get("event_id", "")
+            )
+            return True
+        except Exception as send_error:
+            logger.error(f"Échec de l'envoi du message par défaut: {str(send_error)}")
+            return False
+
+async def handle_message_via_mcp_fallback(data: Dict[str, Any]) -> bool:
+    """
+    Méthode de repli pour traiter un message via MCP si l'API Albert échoue.
+    
+    Args:
+        data: Données du message
+    
+    Returns:
+        bool: True si le message a été traité avec succès, False sinon
+    """
+    try:
+        # Configuration MCP
+        mcp_registry_url = os.environ.get("MCP_REGISTRY_URL", "")
+        mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
+        
+        if not mcp_registry_url:
+            logger.error("URL du registre MCP non configurée")
+            return False
+        
+        # Préparer les données pour MCP
+        mcp_data = {
+            "message": data.get("message", "") or data.get("content", {}).get("body", ""),
+            "sender": data.get("sender", ""),
+            "room_id": data.get("room_id", ""),
+            "event_id": data.get("event_id", ""),
+            "timestamp": data.get("timestamp", str(time.time())),
+            "is_reply": bool(data.get("reply_to", "")),
+            "reply_to": data.get("reply_to", ""),
+            "is_threaded": data.get("is_threaded", False),
+            "thread_root": data.get("thread_root", ""),
+            "source": "matrix"
+        }
+        
+        # Envoyer à MCP
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {mcp_auth_token}" if mcp_auth_token else ""
+            }
+            
+            logger.info(f"Tentative de repli: Envoi du message à MCP pour le salon {data.get('room_id', '')}")
+            
+            # Liste des endpoints à essayer
+            endpoints = [
+                "/api/conversation",
+                "/api/messages", 
+                "/conversation",
+                "/webhooks/matrix"
+            ]
+            
+            # Essayer chaque endpoint
+            for endpoint in endpoints:
+                url = f"{mcp_registry_url.rstrip('/')}{endpoint}"
+                
+                try:
+                    async with session.post(url, json=mcp_data, headers=headers) as response:
+                        if response.status == 200 or response.status == 202:
+                            response_data = await response.json()
+                            logger.info(f"Message traité avec succès par MCP via {endpoint}: {response_data.get('id', '')}")
+                            return True
+                        elif response.status == 404:
+                            logger.warning(f"Endpoint {endpoint} non trouvé: {response.status}")
+                            # Continuer avec le prochain endpoint
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"Échec du traitement du message par MCP via {endpoint}: {response.status} - {error_text[:100]}...")
+                            if response.status != 404:
+                                return False
+                except Exception as e:
+                    logger.error(f"Erreur lors de la connexion à l'endpoint {endpoint}: {str(e)}")
+                    continue
+            
+            # Si on arrive ici, c'est qu'aucun endpoint n'a fonctionné
+            logger.warning("Aucun endpoint MCP n'est disponible pour le repli.")
+            return False
+                
+    except Exception as e:
+        logger.error(f"Erreur lors du repli vers MCP: {str(e)}")
+        import traceback
+        logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
+        return False
+
+async def setup_matrix_listener():
+    """Configure l'écouteur Matrix pour transmettre les messages à n8n"""
+    global matrix_access_token, last_sync_token, matrix_username
+    
+    if not MATRIX_HOMESERVER or not MATRIX_USERNAME or not MATRIX_PASSWORD:
+        logger.warning("Configuration Matrix incomplète, l'écouteur ne sera pas activé")
+        return False
+    
+    # Formats d'identifiants possibles
+    username_formats = [
+        MATRIX_USERNAME,
+        f"@{MATRIX_USERNAME}",
+        f"@{MATRIX_USERNAME}:{MATRIX_HOMESERVER.split('//')[1]}"
+    ]
+    
+    success = False
+    
+    # Essayer différents formats d'identifiant
+    for username_format in username_formats:
+        logger.info(f"Essai avec le format d'identifiant: {username_format}")
+        
+        # Se connecter à l'API Matrix
+        try:
+            async with aiohttp.ClientSession() as session:
+                # 1. S'authentifier et obtenir un token
+                login_url = f"{MATRIX_HOMESERVER}/_matrix/client/r0/login"
+                login_data = {
+                    "type": "m.login.password",
+                    "user": username_format,
+                    "password": MATRIX_PASSWORD
+                }
+                
+                logger.info(f"Tentative de connexion à {MATRIX_HOMESERVER}")
+                async with session.post(login_url, json=login_data) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f"Échec de connexion à Matrix avec format {username_format}: {response.status} - {error_text}")
+                        continue  # Essayer le format suivant
+                    
+                    login_response = await response.json()
+                    access_token = login_response.get("access_token")
+                    if not access_token:
+                        logger.error("Pas de token d'accès dans la réponse Matrix")
+                        continue  # Essayer le format suivant
+                    
+                    logger.info(f"Connexion à Matrix réussie avec format {username_format}")
+                    success = True
+                    
+                    # Stocker le token pour une utilisation ultérieure
+                    if STORE_ACCESS_TOKEN:
+                        matrix_access_token = access_token
+                        logger.info("Token d'accès Matrix enregistré pour l'enrichissement des données")
+                    
+                    # 2. Initialiser l'écouteur Matrix pour transmettre les messages
+                    bot_user_id = login_response.get("user_id")
+                    
+                    # Stocker l'identifiant utilisateur normalisé
+                    matrix_username = bot_user_id
+                    logger.info(f"Nom d'utilisateur Matrix normalisé: {matrix_username}")
+                    
+                    logger.info(f"Connexion à Matrix réussie pour l'écouteur (user_id: {bot_user_id})")
+                    
+                    # Initialiser tous les salons auxquels le bot est connecté
+                    await initialize_all_rooms(access_token)
+                    
+                    # Configurer l'écouteur de synchronisation Matrix
+                    timestamp = time.monotonic()
+                    logger.info(f"Timestamp de démarrage: {timestamp}")
+                    
+                    # Lancer l'écouteur de synchronisation dans un thread séparé
+                    sync_task = asyncio.create_task(sync_loop(access_token, bot_user_id))
+                    
+                    # Stocker la tâche pour éviter qu'elle ne soit annulée lors du garbage collection
+                    if not hasattr(setup_matrix_listener, "tasks"):
+                        setup_matrix_listener.tasks = []
+                    setup_matrix_listener.tasks.append(sync_task)
+                    
+                    logger.info("Écouteur Matrix configuré et démarré")
+                    logger.info("Écouteur Matrix activé pour transmettre les messages à n8n")
+                    
+                    # Ne pas essayer les autres formats si la connexion a réussi
+                    return True
+        except Exception as e:
+            logger.error(f"Erreur lors de la configuration de l'écouteur Matrix: {str(e)}")
+            import traceback
+            logger.error(f"Détails de l'erreur pour {username_format}: {traceback.format_exc()}")
+            continue  # Essayer le format suivant
+    
+    if not success:
+        logger.error("Tous les formats d'identifiant ont échoué, l'écouteur Matrix ne sera pas activé")
+    
+    return success
+
+async def initialize_room(room_id, access_token):
+    """
+    Initialise le bot dans un salon spécifique en récupérant les informations pertinentes
+    
+    Args:
+        room_id: ID du salon Matrix
+        access_token: Token d'accès Matrix
+    
+    Returns:
+        dict: Informations sur le salon ou None en cas d'erreur
+    """
+    logger.info(f"Initialisation du bot dans le salon {room_id}")
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 1. Récupérer les informations de base du salon
+            room_state_url = f"{MATRIX_HOMESERVER}/_matrix/client/r0/rooms/{room_id}/state"
+            headers = {"Authorization": f"Bearer {access_token}"}
+            
+            async with session.get(room_state_url, headers=headers) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"Échec de récupération de l'état du salon {room_id}: {response.status} - {error_text}")
+                    return None
+                
+                room_state = await response.json()
+                
+                # 2. Récupérer les membres du salon
+                members_url = f"{MATRIX_HOMESERVER}/_matrix/client/r0/rooms/{room_id}/joined_members"
+                
+                async with session.get(members_url, headers=headers) as members_response:
+                    if members_response.status != 200:
+                        error_text = await members_response.text()
+                        logger.error(f"Échec de récupération des membres du salon {room_id}: {members_response.status} - {error_text}")
+                        return None
+                    
+                    members_data = await members_response.json()
+                    joined_members = members_data.get("joined", {})
+                    
+                    # Déterminer si c'est un DM ou un salon de groupe
+                    is_direct_message = len(joined_members) == 2
+                    
+                    # 3. Récupérer le nom du salon
+                    room_name = None
+                    for event in room_state:
+                        if event.get("type") == "m.room.name":
+                            room_name = event.get("content", {}).get("name")
+                            break
+                    
+                    # Si pas de nom et DM, utiliser le nom de l'autre utilisateur
+                    if not room_name and is_direct_message:
+                        # Trouver l'autre utilisateur (pas le bot)
+                        bot_id = list(filter(lambda x: x.endswith(MATRIX_USERNAME), joined_members.keys()))
+                        other_users = [user_id for user_id in joined_members.keys() if user_id not in bot_id]
+                        
+                        if other_users:
+                            other_user = other_users[0]
+                            other_user_data = joined_members.get(other_user, {})
+                            room_name = other_user_data.get("display_name", "Utilisateur inconnu")
+                    
+                    room_info = {
+                        "room_id": room_id,
+                        "name": room_name or "Salon sans nom",
+                        "is_direct_message": is_direct_message,
+                        "members": joined_members,
+                        "member_count": len(joined_members),
+                        "initialized": True,
+                        "initialization_time": time.time()
+                    }
+                    
+                    logger.info(f"Salon {room_id} initialisé avec succès: {room_name} - DM: {is_direct_message} - Membres: {len(joined_members)}")
+                    
+                    # Stocker ces informations pour une utilisation ultérieure
+                    global WEBHOOK_ROOM_MAP
+                    WEBHOOK_ROOM_MAP[room_id] = room_info
+                    
+                    return room_info
+    except Exception as e:
+        logger.error(f"Erreur lors de l'initialisation du salon {room_id}: {str(e)}")
+        import traceback
+        logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
+        return None
+
+async def initialize_all_rooms(access_token):
+    """
+    Initialise le bot dans tous les salons auxquels il est connecté
+    
+    Args:
+        access_token: Token d'accès Matrix
+    
+    Returns:
+        int: Nombre de salons initialisés avec succès
+    """
+    logger.info("Initialisation du bot dans tous les salons")
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 1. Récupérer la liste des salons auxquels le bot est connecté
+            joined_rooms_url = f"{MATRIX_HOMESERVER}/_matrix/client/r0/joined_rooms"
+            headers = {"Authorization": f"Bearer {access_token}"}
+            
+            async with session.get(joined_rooms_url, headers=headers) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"Échec de récupération des salons: {response.status} - {error_text}")
+                    return 0
+                
+                joined_rooms_data = await response.json()
+                joined_rooms = joined_rooms_data.get("joined_rooms", [])
+                
+                logger.info(f"Le bot est connecté à {len(joined_rooms)} salons")
+                
+                # 2. Initialiser chaque salon
+                initialized_count = 0
+                for room_id in joined_rooms:
+                    room_info = await initialize_room(room_id, access_token)
+                    if room_info:
+                        initialized_count += 1
+                
+                logger.info(f"{initialized_count}/{len(joined_rooms)} salons initialisés avec succès")
+                return initialized_count
+    except Exception as e:
+        logger.error(f"Erreur lors de l'initialisation des salons: {str(e)}")
+        import traceback
+        logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
+        return 0
+
+# Fonction pour gérer les événements de synchronisation Matrix  
+async def sync_loop(access_token, bot_user_id):
+    """
+    Boucle de synchronisation Matrix pour récupérer les nouveaux messages
+    
+    Args:
+        access_token: Token d'accès Matrix
+        bot_user_id: ID utilisateur du bot
+    """
+    global last_sync_token
+    
+    try:
+        # Initialiser le token de synchronisation s'il n'existe pas
+        sync_token = last_sync_token
+        
+        while True:
+            try:
+                # URL pour la synchronisation Matrix
+                sync_url = f"{MATRIX_HOMESERVER}/_matrix/client/r0/sync"
+                params = {
+                    "timeout": 30000  # 30 secondes
+                }
+                
+                # Ajouter le token de synchronisation si disponible
+                if sync_token:
+                    params["since"] = sync_token
+                    
+                # En-têtes avec le token d'authentification
+                headers = {"Authorization": f"Bearer {access_token}"}
+                
+                # Effectuer la requête de synchronisation
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(sync_url, params=params, headers=headers) as response:
+                        if response.status != 200:
+                            error_text = await response.text()
+                            logger.error(f"Échec de synchronisation Matrix: {response.status} - {error_text}")
+                            await asyncio.sleep(5)  # Attendre avant de réessayer
+                            continue
+                            
+                        json_response = await response.json()
+                        
+                        # Récupérer le nouveau token de synchronisation
+                        if "next_batch" in json_response:
+                            sync_token = json_response["next_batch"]
+                            last_sync_token = sync_token
+                            
+                        # Vérifier s'il y a des nouveaux messages
+                        if "rooms" in json_response:
+                            # Traiter les invitations
+                            if "invite" in json_response["rooms"]:
+                                await process_invitations(json_response["rooms"]["invite"], access_token, bot_user_id)
+                                
+                            # Traiter les salons rejoints
+                            if "join" in json_response["rooms"]:
+                                for room_id, room_data in json_response["rooms"]["join"].items():
+                                    # Vérifier s'il y a de nouveaux messages
+                                    if "timeline" in room_data and "events" in room_data["timeline"]:
+                                        events = room_data["timeline"]["events"]
+                                        # Ajouter l'ID de salon à chaque événement
+                                        for event in events:
+                                            event["room_id"] = room_id
+                                        
+                                        # Traiter les événements
+                                        await process_matrix_sync(events, bot_user_id)
+            
+            except aiohttp.ClientError as e:
+                logger.error(f"Erreur de connexion Matrix: {str(e)}")
+                await asyncio.sleep(10)  # Attendre avant de réessayer
+                
+            except Exception as e:
+                logger.error(f"Erreur dans la boucle de synchronisation: {str(e)}")
+                import traceback
+                logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
+                await asyncio.sleep(10)  # Attendre avant de réessayer
+                
+            # Courte pause entre les requêtes pour éviter de surcharger le serveur
+            await asyncio.sleep(1)
+            
+    except asyncio.CancelledError:
+        logger.info("Boucle de synchronisation annulée")
+    except Exception as e:
+        logger.error(f"Erreur fatale dans la boucle de synchronisation: {str(e)}")
+        import traceback
+        logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
+
+async def process_invitations(invite_rooms, access_token, bot_user_id):
+    """
+    Traite les invitations à des salons Matrix
+    
+    Args:
+        invite_rooms: Dictionnaire des salons avec invitations
+        access_token: Token d'accès Matrix
+        bot_user_id: ID utilisateur du bot
+    """
+    for room_id, invite_data in invite_rooms.items():
+        logger.info(f"Invitation détectée pour le salon {room_id}")
+        
+        # Vérifier si l'invitation est pour nous
+        events = invite_data.get("invite_state", {}).get("events", [])
+        for event in events:
+            if event.get("type") == "m.room.member" and event.get("state_key") == bot_user_id:
+                sender = event.get("sender", "Unknown")
+                logger.info(f"Invitation de {sender} pour le salon {room_id}")
+                
+                # Accepter l'invitation
+                await accept_invitation(room_id, access_token)
+                break
+
+async def accept_invitation(room_id, access_token):
+    """
+    Accepte une invitation à un salon Matrix
+    
+    Args:
+        room_id: ID du salon Matrix
+        access_token: Token d'accès Matrix
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            # URL pour rejoindre un salon
+            join_url = f"{MATRIX_HOMESERVER}/_matrix/client/r0/rooms/{room_id}/join"
+            headers = {"Authorization": f"Bearer {access_token}"}
+            
+            logger.info(f"Tentative de rejoindre le salon {room_id}")
+            async with session.post(join_url, headers=headers, json={}) as response:
+                if response.status == 200:
+                    logger.info(f"Salon {room_id} rejoint avec succès")
+                    
+                    # Initialiser le salon après l'avoir rejoint
+                    await initialize_room(room_id, access_token)
+                    
+                    # Envoyer un message de bienvenue
+                    welcome_message = "Bonjour ! Je suis Albert, le bot assistant pour Tchap. Utilisez `!aide` pour voir la liste des commandes disponibles."
+                    await send_message_to_matrix(room_id, welcome_message, format_type="markdown")
+                    
+                    return True
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Échec de l'acceptation de l'invitation pour le salon {room_id}: {response.status} - {error_text}")
+                    return False
+    except Exception as e:
+        logger.error(f"Erreur lors de l'acceptation de l'invitation pour le salon {room_id}: {str(e)}")
         import traceback
         logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
         return False
 
 async def start_webhook_server():
     """Démarre le serveur webhook"""
-    app = web.Application(client_max_size=1024**2*10)  # 10 MB max
-    
-    # Log pour toutes les requêtes reçues
+    # Middleware pour logger toutes les requêtes
     @web.middleware
     async def logging_middleware(request, handler):
+        """Middleware pour enregistrer toutes les requêtes et gérer les erreurs"""
         logger.info(f"Requête reçue: {request.method} {request.path}")
         try:
             return await handler(request)
@@ -1234,58 +1964,48 @@ async def start_webhook_server():
             import traceback
             logger.error(f"Détails de l'erreur: {traceback.format_exc()}")
             raise
+            
+    # Vérifier si N8N est activé ou si MCP est configuré
+    n8n_enabled = os.environ.get("N8N_ENABLED", "").lower() == "true"
+    mcp_registry_url = os.environ.get("MCP_REGISTRY_URL", "")
     
-    # Appliquer le middleware à toutes les requêtes
-    app.middlewares.append(logging_middleware)
-    
-    # Endpoint de test pour vérifier que le serveur fonctionne
-    test_endpoint = "/test"
-    app.router.add_route("*", test_endpoint, handle_test_endpoint)
-    
-    # Endpoint Matrix (Tchap → n8n)
-    app.router.add_route("*", WEBHOOK_ENDPOINT, handle_matrix_event)
-    
-    # Endpoint supplémentaire pour n8n
-    additional_endpoint = "/webhook-test/matrix_webhook"
-    app.router.add_route("*", additional_endpoint, handle_matrix_event)
-    
-    # Endpoint entrant (n8n → Tchap)
-    inbound_route = f"{WEBHOOK_ENDPOINT}/inbound"
-    app.router.add_route("*", inbound_route, handle_n8n_webhook)
-    
-    # Endpoint de test n8n
-    test_route = "/webhook-test/matrix_webhook"
-    app.router.add_route("*", test_route, handle_n8n_webhook)
-    
-    # Envoyer un message de bienvenue
-    await send_welcome_message_to_rooms()
-    
-    # Configurer l'écouteur Matrix pour transmettre les messages à n8n
-    listener_setup = await setup_matrix_listener()
-    if listener_setup:
-        logger.info("Écouteur Matrix activé pour transmettre les messages à n8n")
+    if not n8n_enabled and not mcp_registry_url:
+        logger.warning("n8n est désactivé et MCP n'est pas configuré. Les messages ne seront pas transmis.")
+    elif not n8n_enabled:
+        logger.info("n8n est désactivé. Les messages seront transmis via MCP.")
     else:
-        logger.warning("Impossible de configurer l'écouteur Matrix, les messages ne seront pas transmis automatiquement")
+        logger.info("n8n est activé. Les messages seront transmis via webhook.")
+        
+    # Créer l'application web aiohttp
+    app = web.Application(middlewares=[logging_middleware])
     
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, WEBHOOK_HOST, WEBHOOK_PORT)
+    # Ajouter les routes
+    app.add_routes([
+        web.post(WEBHOOK_ENDPOINT, handle_matrix_event),
+        web.get('/test', handle_test_endpoint),
+        web.post('/webhook-test/matrix_webhook', handle_n8n_webhook)
+    ])
     
+    # Configurer et démarrer l'écouteur Matrix
+    if MATRIX_API_ENABLED:
+        try:
+            success = await setup_matrix_listener()
+            if not success:
+                logger.warning("Échec de configuration de l'écouteur Matrix, les messages ne seront pas transmis automatiquement")
+            else:
+                logger.info("Écouteur Matrix configuré avec succès")
+        except Exception as e:
+            logger.error(f"Erreur lors de la configuration de l'écouteur Matrix: {str(e)}")
+            logger.error(traceback.format_exc())
+            logger.warning("L'écouteur Matrix n'a pas pu être démarré, mais le serveur webhook continuera de fonctionner")
+    
+    # Démarrer le serveur web
     logger.info(f"Webhook server started on http://{WEBHOOK_HOST}:{WEBHOOK_PORT}{WEBHOOK_ENDPOINT}")
-    logger.info(f"Test endpoint: http://{WEBHOOK_HOST}:{WEBHOOK_PORT}{test_endpoint}")
-    logger.info(f"Additional webhook endpoint: http://{WEBHOOK_HOST}:{WEBHOOK_PORT}{additional_endpoint}")
+    logger.info(f"Test endpoint: http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/test")
+    logger.info(f"Additional webhook endpoint: http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/webhook-test/matrix_webhook")
     
-    # Log des webhooks entrants configurés
-    if WEBHOOK_INCOMING_ROOMS_CONFIG:
-        logger.info(f"Configured incoming webhooks: {len(WEBHOOK_INCOMING_ROOMS_CONFIG)}")
-        for token, room_id in WEBHOOK_INCOMING_ROOMS_CONFIG.items():
-            logger.info(f"  - Token '{token}' -> Room {room_id}")
-    
-    await site.start()
-    
-    # Garder le serveur en exécution
-    while True:
-        await asyncio.sleep(3600)  # 1 heure
+    # Retourner l'application pour qu'elle puisse être lancée par run_app
+    return app
 
 async def fetch_matrix_event_context(access_token, event_id=None, room_id=None, reply_to=None):
     """
@@ -1393,8 +2113,21 @@ def main():
     logger.info("Starting in webhook-only mode with optimized payload...")
     logger.info("Starting webhook server...")
     
+    async def run_server():
+        app = await start_webhook_server()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, WEBHOOK_HOST, WEBHOOK_PORT)
+        
+        await site.start()
+        logger.info(f"Serveur démarré sur http://{WEBHOOK_HOST}:{WEBHOOK_PORT}")
+        
+        # Maintenir le serveur en vie indéfiniment
+        while True:
+            await asyncio.sleep(3600)  # Attendre une heure
+    
     try:
-        asyncio.run(start_webhook_server())
+        asyncio.run(run_server())
     except KeyboardInterrupt:
         logger.info("Webhook server stopped by user")
     except Exception as e:

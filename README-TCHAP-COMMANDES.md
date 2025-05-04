@@ -43,3 +43,62 @@ Ce bot intègre les commandes spéciales de Tchap, permettant d'envoyer des mess
 ## Activation
 
 Les commandes Tchap sont activées par défaut. Si vous souhaitez les désactiver, modifiez la configuration `groups_used` dans le fichier `config.py` en retirant `"tchap"` de la liste.
+
+# Commandes Albert Tchap
+
+Ce document décrit les commandes disponibles pour le bot Albert Tchap.
+
+## Commandes de base
+
+- `!help` : Affiche l'aide générale du bot
+- `!whoami` : Affiche les informations sur votre compte
+- `!version` : Affiche la version actuelle du bot
+
+## Commandes webhook
+
+- `!webhook` : Affiche l'URL du webhook pour le salon courant
+- `!webhook set <url>` : Définit l'URL du webhook pour le salon courant
+- `!webhook method <GET|POST>` : Définit la méthode HTTP pour le webhook
+- `!webhook status` : Affiche le statut de la configuration du webhook
+- `!webhook incoming` : Configure un token pour recevoir des messages via webhook
+- `!webhook incoming list` : Liste les tokens configurés pour les webhooks entrants
+
+## Commandes Tchap
+
+- `!ping` : Vérifie si le bot est en ligne
+- `!collect` : Collecte des messages du salon
+- `!cleanup [nombre]` : Supprime les derniers messages du bot dans le salon
+
+## Commandes n8n
+
+- `!tools [search <terme>]` : Liste les outils n8n disponibles
+- `!run <nom_outil> [paramètres]` : Exécute un outil n8n avec les paramètres spécifiés
+
+## Commandes MCP (Model Context Protocol)
+
+- `!mcp-tools [search <terme>]` : Liste les outils MCP disponibles
+- `!mcp-tools <server_id>` : Liste les outils d'un serveur MCP spécifique
+- `!mcp-tools refresh` : Force le rafraîchissement de la liste des outils
+- `!mcp-servers` : Liste les serveurs MCP disponibles
+- `!mcp-run <server_id> <nom_outil> [paramètres]` : Exécute un outil MCP
+
+### Exemples d'utilisation des commandes MCP
+
+```
+# Lister tous les serveurs MCP
+!mcp-servers
+
+# Lister tous les outils disponibles
+!mcp-tools
+
+# Lister les outils d'un serveur spécifique
+!mcp-tools demo_weather
+
+# Rechercher des outils MCP
+!mcp-tools search météo
+
+# Exécuter un outil MCP
+!mcp-run demo_weather get_weather ville="Paris"
+```
+
+Le bot peut également suggérer automatiquement des outils MCP pertinents en fonction de vos messages en conversation privée.

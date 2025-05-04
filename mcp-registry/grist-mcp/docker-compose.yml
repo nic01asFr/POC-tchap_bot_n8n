@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  grist-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: grist-mcp
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./grist_mcp_server.py:/app/grist_mcp_server.py
+    environment:
+      - GRIST_API_KEY=${GRIST_API_KEY}
+      - GRIST_API_URL=${GRIST_SERVER_URL}/api
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8083
+    networks:
+      - albert-tchap-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+networks:
+  albert-tchap-network:
+    external: true 

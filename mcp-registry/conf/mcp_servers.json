@@ -1,0 +1,28 @@
+{
+  "grist-mcp": {
+    "name": "Grist MCP",
+    "description": "Serveur MCP pour la gestion de données et tableaux Grist",
+    "url": "http://grist-mcp:8083",
+    "mcp_endpoint": "/mcp",
+    "capabilities": [
+      "list_organizations", 
+      "list_tables", 
+      "get_table_data", 
+      "create_record", 
+      "update_record", 
+      "delete_record"
+    ],
+    "metadata": {
+      "version": "1.0.0",
+      "protocol": "json_rpc",
+      "request_format": {
+        "name": "function_name",
+        "parameters": "object_with_params"
+      }
+    },
+    "command": "python",
+    "args": ["grist_mcp_server.py"],
+    "auto_start": true,
+    "container_name": "albert-tchap-grist-mcp"
+  }
+} 

@@ -1,0 +1,28 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Installer les dépendances de base
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl build-essential && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Installer les dépendances Python
+RUN pip install --no-cache-dir fastapi uvicorn httpx pydantic python-dotenv aiohttp
+
+# Créer requirements.txt (pour référence seulement)
+RUN echo "fastapi\nuvicorn\nhttpx\npydantic\npython-dotenv\naiohttp" > /app/requirements.txt
+
+# Exposer le port MCP pour Grist
+EXPOSE 8083
+
+# Copier les fichiers requis
+COPY grist_mcp_server.py /app/grist_mcp_server.py
+COPY grist_mcp.env /app/.env
+
+# Vérifier que le fichier existe
+RUN ls -la /app/
+
+# Commande par défaut avec chemin explicite
+CMD ["python", "/app/grist_mcp_server.py"] 

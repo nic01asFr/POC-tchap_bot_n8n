@@ -5,9 +5,15 @@
 
 import time
 import asyncio
+import os
+import logging
+from typing import Union
 
 from .matrix_bot.bot import MatrixBot
 from .matrix_bot.config import logger
+from .matrix_bot.auth import auth_matrix
+from .matrix_bot.callbacks import Callbacks
+from .matrix_bot.client import MatrixClient
 
 from .webhook_commands import command_registry
 from .config import env_config
@@ -15,6 +21,7 @@ from .webhook_server import WebhookServer
 # Importer le module tchap_commands pour charger les commandes
 from . import tchap_commands  
 from . import n8n_commands  # Charger les commandes n8n
+import mcp_commands
 
 # TODO/IMPROVE:
 # - if albert-bot is invited in a salon, make it answer only when if it is tagged.
@@ -33,6 +40,51 @@ async def startup_tasks(bot):
         # Store webhook server in bot instance for later reference
         bot.webhook_server = webhook_server
         logger.info("Webhook server started successfully")
+
+
+async def main():
+    # Récupérer l'authentification Matrix
+    auth = auth_matrix(
+        {
+            "username": env_config.matrix_bot_username,
+            "password": env_config.matrix_bot_password,
+            "homeserver": env_config.matrix_home_server,
+        }
+    )
+    
+    # Créer le client Matrix et le bot
+    matrix_client = MatrixClient(auth)
+    callbacks = Callbacks(matrix_client)
+    bot = MatrixBot(matrix_client, callbacks)
+    
+    # Ajouter les groupes de commandes
+    used_groups = set(env_config.groups_used)
+    features = []
+    
+    # Ajouter toujours les commandes de base
+    if "basic" in used_groups:
+        features.extend(command_registry.activate_and_retrieve_group("basic"))
+    
+    # Ajouter les commandes Tchap
+    if "tchap" in used_groups:
+        features.extend(command_registry.activate_and_retrieve_group("tchap"))
+    
+    # Ajouter les commandes webhook
+    if "webhook" in used_groups:
+        features.extend(command_registry.activate_and_retrieve_group("webhook"))
+    
+    # Ajouter les commandes MCP
+    if "mcp" in used_groups:
+        features.extend(command_registry.activate_and_retrieve_group("mcp"))
+
+    # Ajouter les commandes n8n
+    if "n8n" in used_groups:
+        features.extend(command_registry.activate_and_retrieve_group("n8n"))
+    
+    bot.setup_features(features)
+    
+    # Démarrer le bot
+    await bot.start(try_joining_invited_rooms=env_config.join_on_invite)
 
 
 def main():
@@ -78,3 +130,8 @@ def main():
 
     if err:
         raise err
+
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())

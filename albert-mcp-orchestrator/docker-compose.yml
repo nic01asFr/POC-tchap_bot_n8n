@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  mcp-orchestrator:
+    build: .
+    container_name: mcp-orchestrator
+    volumes:
+      - ./src:/app/src
+      - ./compositions:/app/compositions
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/app
+      - MCP_ENV=development
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8000
+      - MCP_DEBUG=true
+      - ALBERT_TCHAP_API_URL=http://albert-tchap:8080/api
+    networks:
+      - albert-network
+    restart: unless-stopped
+
+  vector-db:
+    image: redis/redis-stack:latest
+    container_name: mcp-vector-db
+    ports:
+      - "6379:6379"
+      - "8001:8001"
+    volumes:
+      - vector-db-data:/data
+    networks:
+      - albert-network
+    restart: unless-stopped
+
+volumes:
+  vector-db-data:
+
+networks:
+  albert-network:
+    external: true 

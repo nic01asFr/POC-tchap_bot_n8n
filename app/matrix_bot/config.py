@@ -22,7 +22,7 @@ class BotLibConfig(BaseSettings):
         "it should return the request anyways, in milliseconds",
     )
     join_on_invite: bool = Field(
-        default=False, description="Do the bot automatically join when invited"
+        default=True, description="Do the bot automatically join when invited"
     )
     encryption_enabled: bool = Field(default=ENCRYPTION_ENABLED)
     ignore_unverified_devices: bool = Field(default=True, description="True by default in Element")

@@ -1,0 +1,37 @@
+version: '3'
+
+services:
+  mcp-registry:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./conf:/app/conf
+      - ./.cache:/app/.cache
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Exemple de serveur MCP (commenté par défaut)
+  # mcp-demo-weather:
+  #   image: ghcr.io/albert-tchap/mcp-demo-weather:latest
+  #   ports:
+  #     - "8001:8080"
+  #   environment:
+  #     - MCP_SERVER_NAME=Service Météo
+  #     - MCP_SERVER_ID=demo_weather
+  #     - MCP_REGISTRY_URL=http://mcp-registry:8000
+  #   depends_on:
+  #     - mcp-registry
+
+networks:
+  default:
+    name: mcp-network 

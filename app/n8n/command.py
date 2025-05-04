@@ -37,55 +37,71 @@ class N8nCommandHandler:
         Returns:
             Message de réponse formaté
         """
-        if not args:
-            # Liste toutes les catégories disponibles
-            categories = await self.n8n_client.get_tool_categories()
-            tools_by_category = await self.n8n_client.get_tools_by_category()
+        try:
+            logger.info(f"Traitement de la commande !tools avec args: '{args}'")
             
-            if not categories:
-                return "⚠️ Aucun outil n'est disponible pour le moment."
-            
-            response = "📋 **Catégories d'outils disponibles:**\n\n"
-            for category in sorted(categories):
-                cat_tools = tools_by_category.get(category, [])
-                response += f"**{category.upper()}** ({len(cat_tools)} outils)\n"
+            if not args:
+                # Liste toutes les catégories disponibles
+                logger.info("Récupération des catégories d'outils disponibles")
+                categories = await self.n8n_client.get_tool_categories()
+                tools_by_category = await self.n8n_client.get_tools_by_category()
                 
-            response += "\nUtilisez `!tools <catégorie>` pour voir les outils d'une catégorie"
-            response += "\nUtilisez `!tools search <terme>` pour rechercher des outils"
-            
-            return response
-            
-        if args.startswith("search "):
-            # Recherche par terme
-            query = args[7:].strip()
-            tools = await self.n8n_client.search_tools(query)
-            
-            if not tools:
-                return f"⚠️ Aucun outil trouvé pour '{query}'"
+                if not categories:
+                    logger.warning("Aucune catégorie d'outils trouvée dans la réponse")
+                    return "⚠️ Aucun outil n'est disponible pour le moment."
                 
-            response = f"🔍 **Résultats pour '{query}':**\n\n"
-            for tool in tools:
-                response += f"**{tool.get('name')}** - {tool.get('description')}\n"
+                logger.info(f"Catégories trouvées: {', '.join(categories)}")
+                response = "📋 **Catégories d'outils disponibles:**\n\n"
+                for category in sorted(categories):
+                    cat_tools = tools_by_category.get(category, [])
+                    response += f"**{category.upper()}** ({len(cat_tools)} outils)\n"
+                    
+                response += "\nUtilisez `!tools <catégorie>` pour voir les outils d'une catégorie"
+                response += "\nUtilisez `!tools search <terme>` pour rechercher des outils"
                 
-            response += "\nUtilisez `!run <nom_outil> [paramètres]` pour exécuter un outil"
-            
-            return response
-            
-        else:
-            # Liste les outils d'une catégorie spécifique
-            category = args.strip()
-            tools = await self.n8n_client.get_tools_in_category(category)
-            
-            if not tools:
-                return f"⚠️ Aucun outil trouvé dans la catégorie '{category}'"
+                return response
                 
-            response = f"🧰 **Outils dans {category.upper()}:**\n\n"
-            for tool in tools:
-                response += f"**{tool.get('name')}** - {tool.get('description')}\n"
+            if args.startswith("search "):
+                # Recherche par terme
+                query = args[7:].strip()
+                logger.info(f"Recherche d'outils avec le terme: '{query}'")
+                tools = await self.n8n_client.search_tools(query)
                 
-            response += "\nUtilisez `!run <nom_outil> [paramètres]` pour exécuter un outil"
-            
-            return response
+                if not tools:
+                    logger.info(f"Aucun outil trouvé pour le terme: '{query}'")
+                    return f"⚠️ Aucun outil trouvé pour '{query}'"
+                    
+                logger.info(f"Outils trouvés: {len(tools)}")
+                response = f"🔍 **Résultats pour '{query}':**\n\n"
+                for tool in tools:
+                    response += f"**{tool.get('name')}** - {tool.get('description')}\n"
+                    
+                response += "\nUtilisez `!run <nom_outil> [paramètres]` pour exécuter un outil"
+                
+                return response
+                
+            else:
+                # Liste les outils d'une catégorie spécifique
+                category = args.strip()
+                logger.info(f"Récupération des outils dans la catégorie: '{category}'")
+                tools = await self.n8n_client.get_tools_in_category(category)
+                
+                if not tools:
+                    logger.info(f"Aucun outil trouvé dans la catégorie: '{category}'")
+                    return f"⚠️ Aucun outil trouvé dans la catégorie '{category}'"
+                    
+                logger.info(f"Outils trouvés dans la catégorie {category}: {len(tools)}")
+                response = f"🧰 **Outils dans {category.upper()}:**\n\n"
+                for tool in tools:
+                    response += f"**{tool.get('name')}** - {tool.get('description')}\n"
+                    
+                response += "\nUtilisez `!run <nom_outil> [paramètres]` pour exécuter un outil"
+                
+                return response
+                
+        except Exception as e:
+            logger.exception(f"Erreur lors du traitement de la commande !tools: {str(e)}")
+            return f"⚠️ Erreur lors de la récupération des outils: {str(e)}"
     
     async def handle_run_command(self, args: str) -> str:
         """

@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  mcp-registry:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp-registry-standard
+    container_name: albert-tchap-mcp-registry
+    restart: unless-stopped
+    ports:
+      - "8001:8001"  # Port pour le MCP Registry
+    volumes:
+      - ./app:/app/app  # Montage du code source (pour le développement)
+      - ./conf:/app/conf  # Montage des configurations
+      - ./data/embeddings_cache:/app/data/embeddings_cache  # Cache pour les embeddings
+      - ./.env:/app/.env  # Montage du fichier .env
+    environment:
+      - MCP_APP_PORT=8001
+      - MCP_HOST=0.0.0.0
+      - MCP_DISCOVERY_ENABLED=true
+      - MCP_FEATURES_RESOURCES=true
+      - MCP_FEATURES_PROMPTS=true
+      - MCP_FEATURES_TOOLS=true
+      - LOG_LEVEL=INFO
+      - ALBERT_API_TOKEN=${ALBERT_API_TOKEN}
+      - ALBERT_API_URL=${ALBERT_API_URL}
+      - ALBERT_MODEL=${ALBERT_MODEL}
+      # Variables pour substitution dans mcp_servers.json
+      - GRIST_API_KEY=${GRIST_API_KEY}
+      - GRIST_SERVER_URL=${GRIST_SERVER_URL}
+      # Configuration des serveurs MCP à découvrir automatiquement
+      - MCP_SERVER_URLS=http://grist-mcp:8083,http://localhost:8083,http://host.docker.internal:8083
+    networks:
+      - mcp-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Pour permettre d'accéder aux services sur la machine hôte
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # Service Grist MCP (exemple)
+  grist-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.grist-mcp
+    container_name: albert-tchap-grist-mcp
+    restart: unless-stopped
+    ports:
+      - "8083:8083"  # Port pour le serveur MCP Grist
+    environment:
+      - GRIST_API_KEY=${GRIST_API_KEY}
+      - GRIST_API_URL=${GRIST_SERVER_URL}/api
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8083
+    volumes:
+      - ./grist_mcp_server.py:/app/grist_mcp_server.py
+      - ./grist_mcp.env:/app/.env
+    networks:
+      - mcp-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - mcp-registry
+
+networks:
+  mcp-network:
+    name: mcp-network
+    driver: bridge 
